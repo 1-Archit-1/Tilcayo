@@ -1,0 +1,6 @@
+docker run --rm \
+  -v $(pwd):/data \
+  -e INPUT_PATH="~/test_data/*.parquet" \
+  -e OUTPUT_PATH="/data/output.csv" \
+  -e QUERY="SELECT * FROM read_parquet(getenv('INPUT_PATH')) LIMIT 10" \
+  duckdb-worker
