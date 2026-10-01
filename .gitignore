@@ -1,0 +1,5 @@
+# DuckDB CLI binary and source archive — not needed, pip installs the Python package
+duckdb
+duckdb.zip
+*plan.md
+*PLAN.md
