@@ -3,30 +3,13 @@ import re
 import sys
 import duckdb
 
+from shared.storage import configure_storage
+
 EXTENSIONS = [e.strip() for e in os.environ.get('DUCKDB_EXTENSIONS', '').split(',') if e.strip()]
-
-def configure_storage(con: duckdb.DuckDBPyConnection):
-    """
-    Configure httpfs for S3-compatible storage providers.
-    See workers/shared/entrypoint.py for full documentation.
-    """
-    if 'httpfs' not in EXTENSIONS:
-        return
-
-    endpoint  = os.environ.get('TILCAYO_S3_ENDPOINT')
-    url_style = os.environ.get('TILCAYO_S3_URL_STYLE', 'vhost')
-    use_ssl   = os.environ.get('TILCAYO_S3_USE_SSL', 'true').lower()
-
-    if endpoint:
-        con.execute(f"SET s3_endpoint='{endpoint}';")
-
-    con.execute(f"SET s3_url_style='{url_style}';")
-
-    if use_ssl in ('false', '0', 'no'):
-        con.execute("SET s3_use_ssl=false;")
 
 # Lazy-load the embedding model only if the query needs it
 _model = None
+
 
 def get_model():
     global _model
@@ -35,6 +18,7 @@ def get_model():
         model_name = os.environ.get('EMBEDDING_MODEL', 'all-MiniLM-L6-v2')
         _model = SentenceTransformer(model_name)
     return _model
+
 
 def resolve_embeds(query: str) -> str:
     """
@@ -60,6 +44,7 @@ def resolve_embeds(query: str) -> str:
 
     return pattern.sub(replace_match, query)
 
+
 def main():
     query = os.environ.get('QUERY')
     if not query:
@@ -80,7 +65,7 @@ def main():
     for ext in EXTENSIONS:
         con.execute(f"LOAD {ext};")
 
-    configure_storage(con)
+    configure_storage(con, EXTENSIONS)
 
     try:
         if output_path:
@@ -90,6 +75,7 @@ def main():
     except Exception as e:
         print(f"Error executing query:\n{e}", file=sys.stderr)
         sys.exit(1)
+
 
 if __name__ == "__main__":
     main()

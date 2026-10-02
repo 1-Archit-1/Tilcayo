@@ -20,6 +20,8 @@ RUN python -c "from sentence_transformers import SentenceTransformer; SentenceTr
 
 ENV DUCKDB_EXTENSIONS="vss,httpfs"
 
-COPY entrypoint.py /entrypoint.py
+# Build context must be workers/ root (same as spatial) so shared/ is reachable
+COPY shared/ /shared/
+COPY ml/entrypoint.py /entrypoint.py
 
 ENTRYPOINT ["python", "/entrypoint.py"]

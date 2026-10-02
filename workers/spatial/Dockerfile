@@ -15,6 +15,7 @@ RUN python -c "import duckdb; con = duckdb.connect(); con.execute('INSTALL spati
 
 ENV DUCKDB_EXTENSIONS="spatial,httpfs"
 
-COPY ../shared/entrypoint.py /entrypoint.py
+COPY shared/storage.py /storage.py
+COPY shared/entrypoint.py /entrypoint.py
 
 ENTRYPOINT ["python", "/entrypoint.py"]

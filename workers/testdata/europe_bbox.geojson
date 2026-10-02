@@ -1,0 +1,6 @@
+{
+  "type": "FeatureCollection",
+  "features": [
+    {"type":"Feature","properties":{"region":"Europe"},"geometry":{"type":"Polygon","coordinates":[[[-25,34],[45,34],[45,72],[-25,72],[-25,34]]]}}
+  ]
+}

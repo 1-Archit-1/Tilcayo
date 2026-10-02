@@ -7,6 +7,7 @@ RUN python -c "import duckdb; con = duckdb.connect(); con.execute('INSTALL httpf
 
 ENV DUCKDB_EXTENSIONS="httpfs"
 
-COPY ../shared/entrypoint.py /entrypoint.py
+COPY shared/storage.py /storage.py
+COPY shared/entrypoint.py /entrypoint.py
 
 ENTRYPOINT ["python", "/entrypoint.py"]
