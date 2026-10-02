@@ -8,7 +8,7 @@ RUN apt-get update && apt-get install -y \
     gdal-bin \
     && rm -rf /var/lib/apt/lists/*
 
-RUN pip install --no-cache-dir duckdb==1.1.1
+RUN pip install --no-cache-dir duckdb
 
 # Pre-install extensions at build time — no internet calls at runtime
 RUN python -c "import duckdb; con = duckdb.connect(); con.execute('INSTALL spatial'); con.execute('INSTALL httpfs');"

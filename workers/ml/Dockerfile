@@ -6,10 +6,16 @@ RUN apt-get update && apt-get install -y \
     build-essential \
     && rm -rf /var/lib/apt/lists/*
 
+# Torch CPU-only first — this one you always want to pin the index URL
+# otherwise pip grabs the CUDA build which is ~2.5GB
 RUN pip install --no-cache-dir \
-    duckdb==1.1.1 \
-    sentence-transformers==3.0.1 \
-    numpy==1.26.4
+    torch --index-url https://download.pytorch.org/whl/cpu
+    
+# Everything else unpinned — pip resolves latest compatible versions
+RUN pip install --no-cache-dir \
+    sentence-transformers \
+    duckdb
+
 
 # Pre-install extensions at build time — no internet calls at runtime
 RUN python -c "import duckdb; con = duckdb.connect(); con.execute('INSTALL vss'); con.execute('INSTALL httpfs');"
