@@ -117,6 +117,7 @@ echo ""
 echo "── Test 1: SELECT from CSV (stdout)"
 docker run --rm \
   -v "$(pwd)/testdata:/data" \
+  -e TILCAYO_ALLOWED_INPUTS=/data/ \
   -e QUERY="SELECT * FROM read_csv('/data/users.csv') WHERE city = 'New York'" \
   tilcayo/worker-general:test
 
@@ -125,6 +126,7 @@ echo ""
 echo "── Test 2: JOIN two CSVs → output.parquet"
 docker run --rm \
   -v "$(pwd)/testdata:/data" \
+  -e TILCAYO_ALLOWED_INPUTS=/data/ \
   -e QUERY="SELECT u.name, o.product, o.amount FROM read_csv('/data/users.csv') u JOIN read_csv('/data/orders.csv') o ON u.id = o.user_id ORDER BY u.name" \
   -e OUTPUT_PATH="/data/output_join.parquet" \
   tilcayo/worker-general:test
@@ -132,6 +134,7 @@ docker run --rm \
 echo "Wrote testdata/output_join.parquet — reading it back:"
 docker run --rm \
   -v "$(pwd)/testdata:/data" \
+  -e TILCAYO_ALLOWED_INPUTS=/data/ \
   -e QUERY="SELECT * FROM read_parquet('/data/output_join.parquet')" \
   tilcayo/worker-general:test
 
@@ -163,6 +166,7 @@ echo ""
 echo "── Test 5: ST_Read GeoJSON → stdout"
 docker run --rm \
   -v "$(pwd)/testdata:/data" \
+  -e TILCAYO_ALLOWED_INPUTS=/data/ \
   -e QUERY="SELECT name, pop, ST_AsText(geom) AS wkt FROM ST_Read('/data/cities.geojson')" \
   tilcayo/worker-spatial:test
 
@@ -171,6 +175,7 @@ echo ""
 echo "── Test 6: Spatial filter — cities within Europe bbox"
 docker run --rm \
   -v "$(pwd)/testdata:/data" \
+  -e TILCAYO_ALLOWED_INPUTS=/data/ \
   -e QUERY="SELECT c.name FROM ST_Read('/data/cities.geojson') c, ST_Read('/data/europe_bbox.geojson') e WHERE ST_Within(c.geom, e.geom)" \
   tilcayo/worker-spatial:test
 
@@ -179,6 +184,7 @@ echo ""
 echo "── Test 7: ST_Read → output GeoJSON"
 docker run --rm \
   -v "$(pwd)/testdata:/data" \
+  -e TILCAYO_ALLOWED_INPUTS=/data/ \
   -e QUERY="SELECT name, pop, geom FROM ST_Read('/data/cities.geojson') WHERE pop > 5000000" \
   -e OUTPUT_PATH="/data/output_big_cities.geojson" \
   tilcayo/worker-spatial:test
@@ -190,6 +196,7 @@ echo ""
 echo "── Test 8: Mix CSV + GeoJSON — match users to cities by name"
 docker run --rm \
   -v "$(pwd)/testdata:/data" \
+  -e TILCAYO_ALLOWED_INPUTS=/data/ \
   -e QUERY="SELECT u.name AS user_name, c.name AS city_name, c.pop FROM read_csv('/data/users.csv') u JOIN ST_Read('/data/cities.geojson') c ON u.city = c.name" \
   tilcayo/worker-spatial:test
 
@@ -207,7 +214,8 @@ echo ""
 echo "── Test 9: array_distance — raw vector query"
 docker run --rm \
   -v "$(pwd)/testdata:/data" \
-  -e QUERY="SELECT id, text, array_distance(embedding, [0.1, 0.2, 0.3, 0.4]::FLOAT[4]) AS dist FROM read_parquet('/data/embeddings.parquet') ORDER BY dist LIMIT 3" \
+  -e TILCAYO_ALLOWED_INPUTS=/data/ \
+  -e QUERY="SELECT id, text, array_distance(embedding::FLOAT[4], [0.1, 0.2, 0.3, 0.4]::FLOAT[4]) AS dist FROM read_parquet('/data/embeddings.parquet') ORDER BY dist LIMIT 3" \
   tilcayo/worker-ml:test
 
 # ── Test 10: embed() macro — vector generated at query time
@@ -227,12 +235,13 @@ docker run --rm \
   -v "$(pwd)/testdata:/data" \
   -e QUERY="
     WITH docs AS (
-        SELECT 1 AS id, 'climate change policy' AS text
-        UNION ALL SELECT 2, 'machine learning algorithms'
-        UNION ALL SELECT 3, 'renewable energy sources'
+        -- embed() is resolved before DuckDB runs, so it only accepts string literals
+        SELECT 1 AS id, 'climate change policy' AS text, embed('climate change policy') AS e
+        UNION ALL SELECT 2, 'machine learning algorithms', embed('machine learning algorithms')
+        UNION ALL SELECT 3, 'renewable energy sources', embed('renewable energy sources')
     )
     SELECT id, text,
-           array_distance(embed(text), embed('clean energy and climate')) AS dist
+           array_distance(e, embed('clean energy and climate')) AS dist
     FROM docs
     ORDER BY dist
   " \

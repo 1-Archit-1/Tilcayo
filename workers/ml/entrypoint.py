@@ -1,9 +1,8 @@
 import os
 import re
 import sys
-import duckdb
 
-from shared.storage import configure_storage
+from shared.storage import open_connection, run_query
 
 EXTENSIONS = [e.strip() for e in os.environ.get('DUCKDB_EXTENSIONS', '').split(',') if e.strip()]
 
@@ -60,21 +59,9 @@ def main():
         print(f"Error generating embeddings:\n{e}", file=sys.stderr)
         sys.exit(1)
 
-    con = duckdb.connect()
-
-    for ext in EXTENSIONS:
-        con.execute(f"LOAD {ext};")
-
-    configure_storage(con, EXTENSIONS)
-
-    try:
-        if output_path:
-            con.execute(f"COPY ({query}) TO '{output_path}'")
-        else:
-            con.sql(query).show()
-    except Exception as e:
-        print(f"Error executing query:\n{e}", file=sys.stderr)
-        sys.exit(1)
+    # Single-SELECT guard runs inside run_query, i.e. after embed() resolution
+    con = open_connection(EXTENSIONS, output_path)
+    run_query(con, query, output_path)
 
 
 if __name__ == "__main__":
