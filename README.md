@@ -11,7 +11,7 @@ This project is under active development. The worker layer (Phase 1) is complete
 ## How it works
 
 ```
-POST /jobs  { "engine": "spatial", "sql": "...", "output_path": "s3://..." }
+POST /jobs  { "engine": "spatial", "sql": "...", "webhook_url": "https://..." (optional) }
      │
      ▼
 Go Control Plane
