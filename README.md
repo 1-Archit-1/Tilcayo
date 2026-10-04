@@ -1,6 +1,8 @@
 # Tilcayo
 
-Tilcayo is a serverless, stateless SQL query engine platform. You submit a SQL query and an engine type via a REST API. A Go control plane selects the appropriate worker image, spins up an ephemeral Kubernetes Job, executes the query against object-storage-hosted files, writes the result back to object storage, and tears the pod down. No persistent database. No idle compute.
+Tilcayo is a self-hostable, stateless SQL query engine platform. You submit a SQL query and an engine type via a REST API. A Go control plane selects the appropriate worker image, spins up an ephemeral job, executes the query against object-storage-hosted files, writes the result back to object storage, and tears the worker down. No persistent database. No idle compute.
+
+It runs in two modes: **Docker compose** for a single server, and **K3s or Kubernetes** for single or multi-node deployments. Both are first-class. You pick the one that fits your setup.
 
 This project is under active development. The worker layer (Phase 1) is complete. The Go control plane, job watching, and deployment infrastructure are in progress.
 
@@ -15,10 +17,10 @@ POST /jobs  { "engine": "spatial", "sql": "...", "output_path": "s3://..." }
 Go Control Plane
   - validates request
   - selects worker image from engine registry
-  - creates a Kubernetes batch/v1 Job
+  - spawns an ephemeral worker (Docker container or K8s Job, depending on mode)
      │
      ▼
-Ephemeral Worker Pod  (lives only for the duration of the query)
+Ephemeral Worker  (lives only for the duration of the query)
   - DuckDB + engine-specific extensions
   - reads input files from S3-compatible object storage
   - writes results back to object storage
@@ -26,12 +28,28 @@ Ephemeral Worker Pod  (lives only for the duration of the query)
      │
      ▼
 Control Plane
-  - detects job completion via K8s watcher
+  - detects worker completion
   - generates a presigned result URL
   - fires optional webhook to caller
 ```
 
 Adding a new engine means a new Dockerfile and one line in the engine registry. The control plane never changes.
+
+---
+
+## Deployment
+
+Tilcayo runs in two modes, selected by the `TILCAYO_ORCHESTRATOR` environment variable.
+
+### Docker mode (`TILCAYO_ORCHESTRATOR=docker`)
+
+Workers run as ephemeral Docker containers on the same host as the control plane. The whole stack — control plane, MinIO, and workers — comes up with a single `docker compose up`. This is the easiest path for a single server.
+
+### Kubernetes / K3s mode (`TILCAYO_ORCHESTRATOR=kubernetes`)
+
+Workers run as ephemeral `batch/v1` Jobs. The control plane talks to the K8s API via the in-cluster config. K3s is the recommended distribution for self-hosted setups — it installs in minutes on any Linux machine and runs identically on one node or many. As you add nodes to the cluster, K8s automatically schedules worker pods across them with no changes to Tilcayo.
+
+Plain K8s manifests are provided (no Helm required).
 
 ---
 
@@ -90,11 +108,13 @@ cmd/
 internal/
   api/                  # HTTP handlers (planned)
   jobs/                 # job manager, builder, engine registry (planned)
-  k8s/                  # Kubernetes client wrapper (planned)
+  orchestrator/         # Orchestrator interface + Docker and K8s implementations (planned)
   s3/                   # presigned URL generation (planned)
   webhook/              # completion notification (planned)
 
-deploy/                 # Kubernetes manifests (planned)
+deploy/
+  docker/               # docker-compose.yml for Docker mode (planned)
+  kubernetes/           # K8s manifests for K3s/K8s mode (planned)
 ```
 
 ---
