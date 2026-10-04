@@ -4,30 +4,51 @@ import duckdb
 
 def configure_storage(con: duckdb.DuckDBPyConnection, extensions: list[str]):
     """
-    Configure httpfs for S3-compatible storage providers.
+    Configure S3-compatible storage via DuckDB's secrets manager.
 
-    AWS and compatible providers (R2, GCS HMAC) pick up standard env vars
-    automatically: AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_REGION.
+    Replaces the legacy SET s3_* approach, which stored credentials as plain
+    DuckDB config values readable via current_setting(). CREATE SECRET keeps
+    credentials in a redacted in-memory object instead.
 
-    Non-AWS providers (MinIO, R2 custom domain, Backblaze) additionally need
-    endpoint and style configuration, which have no standard env var convention.
-    We define our own:
+    Required env vars (all providers):
+        AWS_ACCESS_KEY_ID
+        AWS_SECRET_ACCESS_KEY
 
-        TILCAYO_S3_ENDPOINT    e.g. minio.example.com:9000
+    Optional env vars:
+        TILCAYO_S3_ENDPOINT    e.g. minio.example.com:9000 (omit for AWS S3)
+        TILCAYO_S3_REGION      e.g. us-east-1 (default); use "auto" for R2
         TILCAYO_S3_URL_STYLE   "path" or "vhost" (default: vhost)
         TILCAYO_S3_USE_SSL     "true" or "false" (default: true)
+
+    After the secret is created, lock_configuration = true is set so user SQL
+    cannot override credentials or inject new secrets.
     """
     if 'httpfs' not in extensions:
         return
 
-    endpoint  = os.environ.get('TILCAYO_S3_ENDPOINT')
-    url_style = os.environ.get('TILCAYO_S3_URL_STYLE', 'vhost')
-    use_ssl   = os.environ.get('TILCAYO_S3_USE_SSL', 'true').lower()
+    key_id     = os.environ.get('AWS_ACCESS_KEY_ID', '')
+    secret_key = os.environ.get('AWS_SECRET_ACCESS_KEY', '')
+    endpoint   = os.environ.get('TILCAYO_S3_ENDPOINT', '')
+    region     = os.environ.get('TILCAYO_S3_REGION', 'us-east-1')
+    url_style  = os.environ.get('TILCAYO_S3_URL_STYLE', 'vhost')
+    use_ssl    = os.environ.get('TILCAYO_S3_USE_SSL', 'true').lower() not in ('false', '0', 'no')
 
+    # Build the secret parameter list. Endpoint is optional — omitting it
+    # means DuckDB routes to AWS S3 by default.
+    params = [
+        f"TYPE S3",
+        f"PROVIDER config",
+        f"KEY_ID '{key_id}'",
+        f"SECRET '{secret_key}'",
+        f"REGION '{region}'",
+        f"URL_STYLE '{url_style}'",
+        f"USE_SSL {str(use_ssl).lower()}",
+    ]
     if endpoint:
-        con.execute(f"SET s3_endpoint='{endpoint}';")
+        params.append(f"ENDPOINT '{endpoint}'")
 
-    con.execute(f"SET s3_url_style='{url_style}';")
+    params_sql = ",\n    ".join(params)
+    con.execute(f"CREATE OR REPLACE SECRET tilcayo_s3 (\n    {params_sql}\n);")
 
-    if use_ssl in ('false', '0', 'no'):
-        con.execute("SET s3_use_ssl=false;")
+    # Lock the connection so user SQL cannot change settings or create secrets.
+    con.execute("SET lock_configuration = true;")
