@@ -179,17 +179,17 @@ docker run --rm \
   -e QUERY="SELECT c.name FROM ST_Read('/data/cities.geojson') c, ST_Read('/data/europe_bbox.geojson') e WHERE ST_Within(c.geom, e.geom)" \
   tilcayo/worker-spatial:test
 
-# ── Test 7: spatial query → output GeoJSON
+# ── Test 7: spatial query → output Parquet (outputs are always .parquet)
 echo ""
-echo "── Test 7: ST_Read → output GeoJSON"
+echo "── Test 7: ST_Read → output Parquet"
 docker run --rm \
   -v "$(pwd)/testdata:/data" \
   -e TILCAYO_ALLOWED_INPUTS=/data/ \
   -e QUERY="SELECT name, pop, geom FROM ST_Read('/data/cities.geojson') WHERE pop > 5000000" \
-  -e OUTPUT_PATH="/data/output_big_cities.geojson" \
+  -e OUTPUT_PATH="/data/output_big_cities.parquet" \
   tilcayo/worker-spatial:test
 
-echo "Wrote testdata/output_big_cities.geojson"
+echo "Wrote testdata/output_big_cities.parquet"
 
 # ── Test 8: spatial join with CSV (mix formats)
 echo ""
