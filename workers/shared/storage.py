@@ -2,10 +2,15 @@ import os
 import sys
 import duckdb
 
-# Credential env vars removed from the process environment before connect().
-# httpfs fills its legacy s3_* settings (readable via current_setting()) from
-# AWS_* env vars at connect/load time, so scrubbing after connect still leaks.
-CREDENTIAL_ENV_VARS = ('AWS_ACCESS_KEY_ID', 'AWS_SECRET_ACCESS_KEY', 'AWS_SESSION_TOKEN')
+# Storage keys are delivered under Tilcayo's own names, which httpfs never reads.
+CREDENTIAL_ENV_VARS = ('TILCAYO_S3_KEY_ID', 'TILCAYO_S3_SECRET')
+
+# httpfs copies AWS_* env vars into its legacy s3_* settings at connect/load
+# time, where user SQL can read them with current_setting(). Any AWS_* var is
+# therefore dropped from os.environ before connect(). This only hides them from
+# httpfs: the values stay in the process's initial environment
+# (/proc/self/environ), which the path allow-list keeps user SQL away from.
+STRAY_ENV_PREFIX = 'AWS_'
 
 
 def fail(message: str):
@@ -22,11 +27,18 @@ def _sql_str(value: str) -> str:
 def take_credentials() -> dict:
     """
     Read storage credentials into a local dict and remove them from os.environ.
+    Also drop any AWS_* var, with a warning naming it (never its value): the
+    worker does not use them, and httpfs would expose them to user SQL.
     Must run BEFORE duckdb.connect().
     """
-    creds = {name: os.environ.get(name, '') for name in CREDENTIAL_ENV_VARS}
-    for name in CREDENTIAL_ENV_VARS:
-        os.environ.pop(name, None)
+    creds = {name: os.environ.pop(name, '') for name in CREDENTIAL_ENV_VARS}
+    stray = sorted(name for name in os.environ if name.startswith(STRAY_ENV_PREFIX))
+    for name in stray:
+        os.environ.pop(name)
+    if stray:
+        print(f"Warning: ignoring and removing {', '.join(stray)}; "
+              "storage keys are read from TILCAYO_S3_KEY_ID / TILCAYO_S3_SECRET only.",
+              file=sys.stderr)
     return creds
 
 
@@ -38,8 +50,9 @@ def configure_storage(con: duckdb.DuckDBPyConnection, extensions: list[str], cre
     DuckDB config values readable via current_setting(). CREATE SECRET keeps
     credentials in a redacted in-memory object instead.
 
-    Credentials come from take_credentials() (AWS_ACCESS_KEY_ID,
-    AWS_SECRET_ACCESS_KEY, optional AWS_SESSION_TOKEN).
+    Credentials come from take_credentials() (TILCAYO_S3_KEY_ID,
+    TILCAYO_S3_SECRET). Static keys only; temporary credentials are not
+    supported in v1.
 
     Optional env vars:
         TILCAYO_S3_ENDPOINT    e.g. minio.example.com:9000 (omit for AWS S3)
@@ -62,14 +75,12 @@ def configure_storage(con: duckdb.DuckDBPyConnection, extensions: list[str], cre
     params = [
         "TYPE S3",
         "PROVIDER config",
-        f"KEY_ID {_sql_str(creds.get('AWS_ACCESS_KEY_ID', ''))}",
-        f"SECRET {_sql_str(creds.get('AWS_SECRET_ACCESS_KEY', ''))}",
+        f"KEY_ID {_sql_str(creds.get('TILCAYO_S3_KEY_ID', ''))}",
+        f"SECRET {_sql_str(creds.get('TILCAYO_S3_SECRET', ''))}",
         f"REGION {_sql_str(region)}",
         f"URL_STYLE {_sql_str(url_style)}",
         f"USE_SSL {str(use_ssl).lower()}",
     ]
-    if creds.get('AWS_SESSION_TOKEN'):
-        params.append(f"SESSION_TOKEN {_sql_str(creds['AWS_SESSION_TOKEN'])}")
     if endpoint:
         params.append(f"ENDPOINT {_sql_str(endpoint)}")
 
