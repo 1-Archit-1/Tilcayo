@@ -17,6 +17,12 @@
 set -e
 cd "$(dirname "$0")"  # always run from workers/
 
+# Workers run the way the control plane will start them: as the caller's
+# uid:gid, read-only root filesystem with a disk-backed /tmp (DuckDB spills
+# there), no capabilities, no privilege escalation.
+RUN=(docker run --rm --user "$(id -u):$(id -g)" --read-only -v /tmp
+     --cap-drop ALL --security-opt no-new-privileges)
+
 # ── Build ─────────────────────────────────────────────────────────────────────
 
 echo ""
@@ -115,7 +121,7 @@ echo "════════════════════════�
 # ── Test 1: query a CSV, print to stdout
 echo ""
 echo "── Test 1: SELECT from CSV (stdout)"
-docker run --rm \
+"${RUN[@]}" \
   -v "$(pwd)/testdata:/data" \
   -e TILCAYO_ALLOWED_INPUTS=/data/ \
   -e QUERY="SELECT * FROM read_csv('/data/users.csv') WHERE city = 'New York'" \
@@ -124,7 +130,7 @@ docker run --rm \
 # ── Test 2: join two CSVs, write output to parquet
 echo ""
 echo "── Test 2: JOIN two CSVs → output.parquet"
-docker run --rm \
+"${RUN[@]}" \
   -v "$(pwd)/testdata:/data" \
   -e TILCAYO_ALLOWED_INPUTS=/data/ \
   -e QUERY="SELECT u.name, o.product, o.amount FROM read_csv('/data/users.csv') u JOIN read_csv('/data/orders.csv') o ON u.id = o.user_id ORDER BY u.name" \
@@ -132,7 +138,7 @@ docker run --rm \
   tilcayo/worker-general:test
 
 echo "Wrote testdata/output_join.parquet — reading it back:"
-docker run --rm \
+"${RUN[@]}" \
   -v "$(pwd)/testdata:/data" \
   -e TILCAYO_ALLOWED_INPUTS=/data/ \
   -e QUERY="SELECT * FROM read_parquet('/data/output_join.parquet')" \
@@ -141,7 +147,7 @@ docker run --rm \
 # ── Test 3: bad query exits 1
 echo ""
 echo "── Test 3: Bad query should exit 1"
-docker run --rm \
+"${RUN[@]}" \
   -v "$(pwd)/testdata:/data" \
   -e QUERY="SELECT * FROM nonexistent_table" \
   tilcayo/worker-general:test && echo "FAIL: expected exit 1" || echo "PASS: exited 1 as expected"
@@ -149,7 +155,7 @@ docker run --rm \
 # ── Test 4: missing QUERY env var exits 1
 echo ""
 echo "── Test 4: Missing QUERY env var should exit 1"
-docker run --rm \
+"${RUN[@]}" \
   tilcayo/worker-general:test && echo "FAIL: expected exit 1" || echo "PASS: exited 1 as expected"
 
 # =============================================================================
@@ -164,7 +170,7 @@ echo "════════════════════════�
 # ── Test 5: read GeoJSON, print to stdout
 echo ""
 echo "── Test 5: ST_Read GeoJSON → stdout"
-docker run --rm \
+"${RUN[@]}" \
   -v "$(pwd)/testdata:/data" \
   -e TILCAYO_ALLOWED_INPUTS=/data/ \
   -e QUERY="SELECT name, pop, ST_AsText(geom) AS wkt FROM ST_Read('/data/cities.geojson')" \
@@ -173,7 +179,7 @@ docker run --rm \
 # ── Test 6: spatial filter — cities within Europe bbox
 echo ""
 echo "── Test 6: Spatial filter — cities within Europe bbox"
-docker run --rm \
+"${RUN[@]}" \
   -v "$(pwd)/testdata:/data" \
   -e TILCAYO_ALLOWED_INPUTS=/data/ \
   -e QUERY="SELECT c.name FROM ST_Read('/data/cities.geojson') c, ST_Read('/data/europe_bbox.geojson') e WHERE ST_Within(c.geom, e.geom)" \
@@ -182,7 +188,7 @@ docker run --rm \
 # ── Test 7: spatial query → output Parquet (outputs are always .parquet)
 echo ""
 echo "── Test 7: ST_Read → output Parquet"
-docker run --rm \
+"${RUN[@]}" \
   -v "$(pwd)/testdata:/data" \
   -e TILCAYO_ALLOWED_INPUTS=/data/ \
   -e QUERY="SELECT name, pop, geom FROM ST_Read('/data/cities.geojson') WHERE pop > 5000000" \
@@ -194,7 +200,7 @@ echo "Wrote testdata/output_big_cities.parquet"
 # ── Test 8: spatial join with CSV (mix formats)
 echo ""
 echo "── Test 8: Mix CSV + GeoJSON — match users to cities by name"
-docker run --rm \
+"${RUN[@]}" \
   -v "$(pwd)/testdata:/data" \
   -e TILCAYO_ALLOWED_INPUTS=/data/ \
   -e QUERY="SELECT u.name AS user_name, c.name AS city_name, c.pop FROM read_csv('/data/users.csv') u JOIN ST_Read('/data/cities.geojson') c ON u.city = c.name" \
@@ -212,7 +218,7 @@ echo "════════════════════════�
 # ── Test 9: raw vector similarity (no embed macro)
 echo ""
 echo "── Test 9: array_distance — raw vector query"
-docker run --rm \
+"${RUN[@]}" \
   -v "$(pwd)/testdata:/data" \
   -e TILCAYO_ALLOWED_INPUTS=/data/ \
   -e QUERY="SELECT id, text, array_distance(embedding::FLOAT[4], [0.1, 0.2, 0.3, 0.4]::FLOAT[4]) AS dist FROM read_parquet('/data/embeddings.parquet') ORDER BY dist LIMIT 3" \
@@ -223,7 +229,7 @@ echo ""
 echo "── Test 10: embed() macro — sentence-transformers generates the vector"
 echo "(Note: embed() produces 384-dim vectors; test data uses 4-dim. This test"
 echo " uses a query that only exercises the macro substitution itself.)"
-docker run --rm \
+"${RUN[@]}" \
   -e QUERY="SELECT array_length(embed('climate change policy')) AS embedding_dimensions" \
   tilcayo/worker-ml:test
 
@@ -231,7 +237,7 @@ docker run --rm \
 # Requires embeddings.parquet to have 384-dim vectors — regenerate with real model
 echo ""
 echo "── Test 11: Full embed() similarity search (regenerates embeddings with real model)"
-docker run --rm \
+"${RUN[@]}" \
   -v "$(pwd)/testdata:/data" \
   -e QUERY="
     WITH docs AS (
