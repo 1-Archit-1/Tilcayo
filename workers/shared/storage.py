@@ -12,6 +12,14 @@ CREDENTIAL_ENV_VARS = ('TILCAYO_S3_KEY_ID', 'TILCAYO_S3_SECRET')
 # (/proc/self/environ), which the path allow-list keeps user SQL away from.
 STRAY_ENV_PREFIX = 'AWS_'
 
+# DuckDB spills here. With a read-only root filesystem, /tmp must be a
+# disk-backed mount (K8s emptyDir, Docker volume): tmpfs counts against the
+# container's memory limit, so spilling to it can cause the OOM kill it avoids.
+TEMP_DIR = '/tmp/duckdb'
+
+CGROUP_MEMORY_MAX = '/sys/fs/cgroup/memory.max'
+DEFAULT_MEMORY_FRACTION = 0.5
+
 
 def fail(message: str):
     """Print an error to stderr and exit 1 (every worker failure exits 1)."""
@@ -125,17 +133,57 @@ def harden_connection(con: duckdb.DuckDBPyConnection, output_path: str | None):
     con.execute("SET lock_configuration = true;")
 
 
+def memory_limit_bytes() -> int | None:
+    """
+    TILCAYO_MEMORY_FRACTION (default 0.5) of the container's cgroup v2 memory
+    limit, or None when the container has no limit (DuckDB's default applies).
+
+    DuckDB's memory_limit caps only its buffer manager. On large sorts the
+    process used about 1.6x the limit, so DuckDB's own default (80% of the
+    cgroup limit) got the container OOM-killed instead of failing cleanly.
+    """
+    raw = os.environ.get('TILCAYO_MEMORY_FRACTION', '')
+    fraction = float(raw) if raw else DEFAULT_MEMORY_FRACTION
+    if not 0 < fraction <= 1:
+        raise ValueError(f"TILCAYO_MEMORY_FRACTION must be in (0, 1]: {raw!r}")
+    try:
+        with open(CGROUP_MEMORY_MAX) as f:
+            limit = f.read().strip()
+    except FileNotFoundError:
+        # cgroup v1 host (or not in a container): the limit can't be read.
+        print("Warning: no cgroup v2 memory limit found; DuckDB uses its own "
+              "memory_limit default (80% of RAM), which may get a capped "
+              "container OOM-killed.", file=sys.stderr)
+        return None
+    if limit == 'max':
+        return None
+    return int(int(limit) * fraction)
+
+
+def configure_resources(con: duckdb.DuckDBPyConnection):
+    """Extension path, spill directory and memory limit. Before LOAD and lock."""
+    extension_dir = os.environ.get('TILCAYO_EXTENSION_DIR')
+    if extension_dir:
+        con.execute(f"SET extension_directory = {_sql_str(extension_dir)};")
+    con.execute(f"SET temp_directory = {_sql_str(TEMP_DIR)};")
+    limit = memory_limit_bytes()
+    if limit is not None:
+        con.execute(f"SET memory_limit = '{limit}B';")
+
+
 def open_connection(extensions: list[str], output_path: str | None) -> duckdb.DuckDBPyConnection:
     """
     Create a hardened DuckDB connection. Order matters:
-      scrub env -> connect -> no persistent secrets -> LOAD -> CREATE SECRET
-      -> allowed_directories -> enable_external_access=false -> lock.
+      scrub env -> connect -> no persistent secrets -> resources -> LOAD
+      -> CREATE SECRET -> allowed_directories -> enable_external_access=false
+      -> lock.
     Any failure exits 1.
     """
     creds = take_credentials()
     try:
         con = duckdb.connect()
         con.execute("SET allow_persistent_secrets = false;")
+        configure_resources(con)
         for ext in extensions:
             con.execute(f"LOAD {ext};")
         configure_storage(con, extensions, creds)
