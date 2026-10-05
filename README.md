@@ -1,6 +1,6 @@
 # Tilcayo
 
-Tilcayo is a self-hostable, stateless SQL query engine platform. You submit a SQL query and an engine type via a REST API. A Go control plane selects the appropriate worker image, spins up an ephemeral job, executes the query against object-storage-hosted files, writes the result back to object storage, and tears the worker down. No persistent database. No idle compute.
+Tilcayo is a self-hostable, stateless SQL query engine platform. You submit a SQL query and an engine type via a REST API. A Go control plane selects the appropriate worker image, spins up an ephemeral job, executes the query against files in object storage or a local data folder, stores the result, and tears the worker down. No persistent database. No idle compute. A single Docker host can run it with no object store at all.
 
 It runs in two modes: **Docker compose** for a single server, and **K3s or Kubernetes** for single or multi-node deployments. Both are first-class. You pick the one that fits your setup.
 
@@ -22,18 +22,198 @@ Go Control Plane
      ▼
 Ephemeral Worker  (lives only for the duration of the query)
   - DuckDB + engine-specific extensions
-  - reads input files from S3-compatible object storage
-  - writes results back to object storage
+  - reads input files from S3-compatible object storage and/or a read-only /data folder
+  - writes the result to object storage (or, store-free, to a per-job local folder)
   - exits 0 on success, 1 on failure
      │
      ▼
 Control Plane
   - detects worker completion
-  - generates a presigned result URL
+  - returns a result URL: presigned (object storage) or served by the control plane (store-free)
   - fires optional webhook to caller
 ```
 
 Adding a new engine means a new Dockerfile and one line in the engine registry. The control plane never changes.
+
+---
+
+## User guide
+
+> **Planned v1, not usable yet.** This guide describes how Tilcayo v1 is designed to work. The control plane, the compose file and the K8s manifests are not built, so the commands below do not run today. Settings marked *provisional* may still be renamed. Anything not decided yet is marked as such rather than guessed.
+
+### Using Tilcayo
+
+**1. Submit a query.** Send the engine and one `SELECT` statement:
+
+```bash
+curl -X POST "$TILCAYO_URL/jobs" \
+  -H 'Content-Type: application/json' \
+  -d '{
+        "engine": "general",
+        "sql": "SELECT city, count(*) AS orders FROM read_csv('\''/data/orders.csv'\'') GROUP BY city",
+        "webhook_url": "https://example.com/hooks/tilcayo"
+      }'
+```
+
+`webhook_url` is optional. The response contains the job id. `TILCAYO_URL` is wherever you reach the control plane; the default port is not decided yet.
+
+**2. Check its status.**
+
+```bash
+curl "$TILCAYO_URL/jobs/<job_id>"
+```
+
+A job is `pending`, `running`, `succeeded`, `failed` or `cancelled`. A failed job includes the worker's error message. When it succeeds, the response includes a `result_url`.
+
+**3. Download the result.**
+
+```bash
+curl -L -o result.parquet "<result_url>"
+```
+
+Results are always Parquet. `result_url` is a presigned object-storage URL when results go to object storage, or `$TILCAYO_URL/jobs/<job_id>/result` in a store-free setup. You use it the same way either way.
+
+**Optional: get notified instead of polling.** If you passed `webhook_url`, the control plane calls it once the job finishes, with the job id and final state. Delivery is best-effort: a webhook due while the control plane is down is not retried, so poll `GET /jobs/<job_id>` if you need certainty.
+
+**Optional: cancel a job.** `POST /jobs/<job_id>/cancel` stops a running job; it then reports `cancelled`. Cancelling a finished job changes nothing.
+
+**Results are kept for 1 hour.** After that the job and its result are deleted and `GET /jobs/<job_id>` returns 404. Download what you need within the hour.
+
+Not decided yet: the exact JSON shape of the responses and webhook payload, and the default port.
+
+### Writing queries
+
+- **One `SELECT` per job.** Anything else (several statements, `COPY`, `CREATE`, `ATTACH`, `INSTALL`) is rejected and the job fails. Multi-statement pipelines may come later.
+- **Local files** live under `/data`, the data folder the operator configures. Refer to them by that path: `read_csv('/data/sales/2026.csv')`, `read_parquet('/data/events/*.parquet')`, `ST_Read('/data/regions.geojson')`. Nothing outside `/data` is readable, and `/data` is read-only.
+- **Object storage** files are referred to as `s3://bucket/key`, and only from the locations the deployment allows. How those allowed input locations are configured is not decided yet.
+- **Mixing works.** One query can join a local CSV with Parquet in object storage.
+- **Pick the engine** for the functions you need: `general` (CSV, Parquet, JSON), `spatial` (`ST_*`, GDAL formats), `ml` (`array_distance`, `embed('text')`). See [Engines](#engines).
+
+### Choosing a setup
+
+| Setup | Orchestrator | Inputs | Results | Object store needed |
+|---|---|---|---|---|
+| Store-free single server | Docker | `/data` | local folder, served by the control plane | no |
+| Single server with a store | Docker | `/data` and/or object storage | object storage (presigned URL) | yes |
+| K3s / Kubernetes | Kubernetes | `/data` (from a PVC) and/or object storage | object storage (presigned URL) | yes |
+
+Store-free results are Docker only in v1: sharing a results folder across cluster nodes would need ReadWriteMany storage.
+
+### Configuration reference
+
+The control plane reads all settings from its environment and passes what each worker needs. Workers are never configured by hand.
+
+| Variable | Needed when | Meaning | Status |
+|---|---|---|---|
+| `TILCAYO_ORCHESTRATOR` | always | `docker` or `kubernetes` | decided |
+| `TILCAYO_RESULTS` | optional | `s3` (default) or `local`. `local` means store-free and is refused in Kubernetes mode | provisional |
+| `TILCAYO_RESULTS_DIR` | `TILCAYO_RESULTS=local` | Host folder for results. Each job gets its own subfolder, deleted after 1h | provisional |
+| `TILCAYO_DATA_SOURCE` | optional | The data folder mounted read-only at `/data`. Docker: an absolute host path. Kubernetes: the name of a PVC. Unset means no `/data` | provisional |
+| `TILCAYO_S3_KEY_ID`, `TILCAYO_S3_SECRET` | `TILCAYO_RESULTS=s3`, or to read object storage | Static access keys | decided |
+| `TILCAYO_S3_REGION` | with the keys | Required, no default. The control plane refuses to start without it | decided |
+| `TILCAYO_S3_ENDPOINT`, `TILCAYO_S3_PUBLIC_ENDPOINT`, `TILCAYO_S3_URL_STYLE`, `TILCAYO_S3_USE_SSL` | depends on the provider | See [Storage](#storage) | decided |
+| Output bucket | `TILCAYO_RESULTS=s3` | Bucket results are written to, as `<bucket>/<job_id>/result.parquet` | name not decided |
+| Allowed object-storage inputs | to read object storage | Which buckets or prefixes queries may read | not decided |
+
+The control plane refuses to start, naming the missing setting, when a required one is unset or does not fit the mode (for example a PVC name given as a path).
+
+### Docker mode setup
+
+**Store-free.** Create two folders on the host: one with your data, one for results.
+
+```bash
+mkdir -p /srv/tilcayo/data /srv/tilcayo/results
+cp orders.csv /srv/tilcayo/data/
+```
+
+```bash
+# tilcayo.env
+TILCAYO_ORCHESTRATOR=docker
+TILCAYO_RESULTS=local
+TILCAYO_RESULTS_DIR=/srv/tilcayo/results
+TILCAYO_DATA_SOURCE=/srv/tilcayo/data
+```
+
+**With object storage.** Leave out `TILCAYO_RESULTS` and `TILCAYO_RESULTS_DIR`, keep `TILCAYO_DATA_SOURCE` if you also want local inputs, and add the store settings. The two keys go in their own file, which compose loads with `env_file` and Kubernetes turns into a Secret:
+
+```bash
+# s3.env  (secret: keep it out of version control)
+TILCAYO_S3_KEY_ID=...
+TILCAYO_S3_SECRET=...
+```
+
+```bash
+# tilcayo.env  (example for a Garage store on the same compose network)
+TILCAYO_ORCHESTRATOR=docker
+TILCAYO_DATA_SOURCE=/srv/tilcayo/data
+TILCAYO_S3_REGION=garage
+TILCAYO_S3_ENDPOINT=garage:3900
+TILCAYO_S3_PUBLIC_ENDPOINT=localhost:3900
+TILCAYO_S3_URL_STYLE=path
+TILCAYO_S3_USE_SSL=false
+```
+
+Things to know:
+
+- **Both folder settings are host paths**, even when the control plane runs in a container: the Docker daemon resolves them on the host. If the control plane runs in a container, mount the results folder into it **at the same path** (`/srv/tilcayo/results:/srv/tilcayo/results`), so it can serve and clean up results. It does not need the data folder.
+- **Workers run as the same user as the control plane**, so result files are owned by that user, not root. Files in the data folder must be readable by that user, or queries on them fail.
+- **A wrong data folder path fails the first job that uses it**, not the startup, because the control plane cannot check host paths from inside its container.
+- **Do not expose the control plane publicly.** v1 has no authentication, it runs any submitted SQL, and in Docker mode it holds the Docker socket, which is root-equivalent on the host. Keep its port on an internal network or bound to `127.0.0.1`. Anyone who can reach it and knows a job id can download that job's result.
+
+Not decided yet: the compose file itself, including the control plane image name and how spawned workers join the compose network.
+
+### K3s / Kubernetes setup
+
+Results always go to object storage in Kubernetes mode. Local files can still be used as inputs through a PVC.
+
+**Storage credentials.** Put the keys in the fixed-name Secret `tilcayo-s3`, using the same `s3.env` file as Docker mode:
+
+```bash
+kubectl create secret generic tilcayo-s3 --from-env-file=s3.env
+```
+
+The control plane loads it with `envFrom`, and each worker gets the keys through `secretKeyRef`, so the values never appear in a pod spec. Non-secret settings (`TILCAYO_ORCHESTRATOR=kubernetes`, `TILCAYO_DATA_SOURCE`, `TILCAYO_S3_REGION`, the endpoints) go in a ConfigMap, like `tilcayo.env` in Docker mode. To rotate keys: create the new key at the provider, update the Secret, restart the control plane with `kubectl rollout restart`, wait for running jobs and issued result URLs to expire (longest job timeout plus 1h), then revoke the old key.
+
+**Local data through a PVC.** Set `TILCAYO_DATA_SOURCE` to the name of a PVC in the same namespace as the worker Jobs. It is mounted read-only at `/data`. On single-node K3s, the simplest way is a PersistentVolume pointing at a host folder:
+
+```yaml
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: tilcayo-data
+spec:
+  capacity:
+    storage: 10Gi
+  accessModes: [ReadOnlyMany]
+  persistentVolumeReclaimPolicy: Retain
+  storageClassName: ""
+  hostPath:
+    path: /srv/tilcayo/data
+    type: Directory
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: tilcayo-data
+spec:
+  accessModes: [ReadOnlyMany]
+  storageClassName: ""
+  volumeName: tilcayo-data
+  resources:
+    requests:
+      storage: 10Gi
+```
+
+```bash
+# in the ConfigMap
+TILCAYO_DATA_SOURCE=tilcayo-data
+```
+
+On several nodes, either add `nodeAffinity` to that PersistentVolume so every job runs on the node holding the folder, or use storage every node can reach (NFS, Longhorn or any ReadOnlyMany / ReadWriteMany storage class) and create the PVC from it. Tilcayo only needs the PVC name. Workers run as the control plane's user, so the files must be readable by that user ID.
+
+**Reaching the control plane.** It runs as a ClusterIP service only, never publicly exposed, for the same reason as in Docker mode. From your machine, use `kubectl port-forward`.
+
+Not decided yet: the manifests themselves, including the namespace, service account and RBAC, and the ConfigMap name.
 
 ---
 
@@ -43,7 +223,7 @@ Tilcayo runs in two modes, selected by the `TILCAYO_ORCHESTRATOR` environment va
 
 ### Docker mode (`TILCAYO_ORCHESTRATOR=docker`)
 
-Workers run as ephemeral Docker containers on the same host as the control plane. The control plane and workers come up with a single `docker compose up`. Tilcayo does not currently ship an object store: you point it at one you already have (see [Storage](#storage)). Bundling a store may be added in the future. This is the easiest path for a single server.
+Workers run as ephemeral Docker containers on the same host as the control plane. The control plane and workers come up with a single `docker compose up`. You can run it with no object store at all (inputs and results live in local folders), or point it at an S3-compatible store you already have (see [Storage](#storage)). Tilcayo does not currently ship a store; bundling one may be added in the future. This is the easiest path for a single server.
 
 ### Kubernetes / K3s mode (`TILCAYO_ORCHESTRATOR=kubernetes`)
 
@@ -71,7 +251,7 @@ Plain DuckDB with `httpfs`. CSV, Parquet, JSON — no domain-specific extensions
 
 ## Storage
 
-Workers and the control plane are provider-agnostic. Any S3-compatible object store works. Tilcayo does not currently ship a store; you bring your own and configure it with the `TILCAYO_S3_*` settings.
+Object storage is optional in store-free Docker setups and required otherwise. Workers and the control plane are provider-agnostic: any S3-compatible object store works. Tilcayo does not currently ship a store; you bring your own and configure it with the `TILCAYO_S3_*` settings.
 
 | Provider | Configuration |
 |---|---|
@@ -92,7 +272,7 @@ Credentials are set up using DuckDB's secrets manager (`CREATE SECRET`) rather t
 
 **Scoping access.** Where the provider allows it, give workers a key that is read-only on input locations and writable only where results go. Garage can only scope a key per bucket (read, write, owner), not per prefix, so on Garage keep inputs and outputs in separate buckets and give the key read-only access to the input bucket. The workers' own checks (below) do not stop user SQL from overwriting files under an input prefix.
 
-**What the workers enforce.** A job must be exactly one `SELECT` statement. User SQL can only touch the output path and the input prefixes the worker is given, and cannot read local files, open HTTP URLs, attach databases, install extensions or create secrets. This is covered by `workers/test_security.sh`. Path tricks such as `..` are not blocked by Tilcayo itself; MinIO and Garage refuse them because the request signature no longer matches.
+**What the workers enforce.** A job must be exactly one `SELECT` statement. User SQL can only touch the output path and the input locations the worker is given (S3 prefixes, and `/data` when a data folder is configured). It cannot read any other local file, open HTTP URLs, attach databases, install extensions or create secrets. This is covered by `workers/test_security.sh`. On local paths, DuckDB itself refuses `..` and symlinks that lead outside an allowed folder. On object storage, `..` is not blocked by Tilcayo; MinIO and Garage refuse it because the request signature no longer matches.
 
 ---
 
