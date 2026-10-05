@@ -75,7 +75,7 @@ Workers and the control plane are provider-agnostic. Any S3-compatible object st
 
 | Provider | Configuration |
 |---|---|
-| AWS S3 | `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `TILCAYO_S3_REGION` |
+| AWS S3 | `TILCAYO_S3_KEY_ID`, `TILCAYO_S3_SECRET`, `TILCAYO_S3_REGION` |
 | MinIO | + `TILCAYO_S3_ENDPOINT`, `TILCAYO_S3_URL_STYLE=path` |
 | Garage | + `TILCAYO_S3_ENDPOINT`, `TILCAYO_S3_URL_STYLE=path`, `TILCAYO_S3_REGION=garage` (its default region) |
 | Cloudflare R2 | + `TILCAYO_S3_ENDPOINT`, `TILCAYO_S3_REGION=auto` |
@@ -86,7 +86,9 @@ Workers are tested against two stores: a Chainguard build of MinIO (`cgr.dev/cha
 
 Set `TILCAYO_S3_REGION` explicitly. The default is `us-east-1`, which MinIO accepts for any region but Garage rejects. `TILCAYO_S3_PUBLIC_ENDPOINT` is optional and defaults to `TILCAYO_S3_ENDPOINT`. Set it when the address workers use differs from the one the caller can reach, for example `garage:3900` inside a Docker network and `localhost:3900` outside.
 
-Credentials are set up using DuckDB's secrets manager (`CREATE SECRET`) rather than the legacy `SET s3_*` approach. The credential environment variables are removed from the worker process before DuckDB starts, and the connection is locked after setup, so user-submitted SQL cannot read back or override credentials.
+Keys are static access keys passed as `TILCAYO_S3_KEY_ID` and `TILCAYO_S3_SECRET`, the same names for every provider. Temporary credentials (session tokens) and AWS pod identity are not supported yet. The worker ignores `AWS_*` variables: it removes them before DuckDB starts and logs a warning naming them, because DuckDB's `httpfs` would otherwise copy them into settings user SQL can read.
+
+Credentials are set up using DuckDB's secrets manager (`CREATE SECRET`) rather than the legacy `SET s3_*` approach, and the connection is locked after setup, so user-submitted SQL cannot read back or override them. The keys do remain in the worker's process environment. User SQL is kept away from it (for example `/proc/self/environ`) by the path allow-list, not by removing the variables. Anyone who can inspect the container can see them: in Kubernetes, inject them from a Secret with `secretKeyRef` so the values stay out of the pod spec.
 
 **Scoping access.** Where the provider allows it, give workers a key that is read-only on input locations and writable only where results go. Garage can only scope a key per bucket (read, write, owner), not per prefix, so on Garage keep inputs and outputs in separate buckets and give the key read-only access to the input bucket. The workers' own checks (below) do not stop user SQL from overwriting files under an input prefix.
 

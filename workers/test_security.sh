@@ -189,14 +189,18 @@ OUTKEY=""   # bucket/key of the last run's OUTPUT_PATH
 
 # run_worker <image> <query>  — real entrypoint, fresh job output path.
 # Optional overrides: ALLOWED (allow-list), WREGION (TILCAYO_S3_REGION),
-# STDOUT_ONLY=1 (no OUTPUT_PATH, result is printed).
+# STDOUT_ONLY=1 (no OUTPUT_PATH, result is printed), STRAY_AWS=1 (also inject
+# the keys as AWS_* vars, as a misconfigured host might).
 run_worker() {
   JOB=$((JOB + 1))
   OUTKEY="data/out/job$JOB/result.parquet"
   local out_args=(-e OUTPUT_PATH="s3://$OUTKEY")
   [ "${STDOUT_ONLY:-0}" = 1 ] && out_args=()
+  local stray_args=()
+  [ "${STRAY_AWS:-0}" = 1 ] && stray_args=(-e AWS_ACCESS_KEY_ID="$ADMIN" -e AWS_SECRET_ACCESS_KEY="$SECRET")
   OUT=$(docker run --rm --network "$NET" \
-    -e AWS_ACCESS_KEY_ID="$ADMIN" -e AWS_SECRET_ACCESS_KEY="$SECRET" \
+    -e TILCAYO_S3_KEY_ID="$ADMIN" -e TILCAYO_S3_SECRET="$SECRET" \
+    ${stray_args[@]+"${stray_args[@]}"} \
     -e TILCAYO_S3_ENDPOINT="$EP" -e TILCAYO_S3_URL_STYLE="$URL_STYLE" -e TILCAYO_S3_USE_SSL=false \
     -e TILCAYO_S3_REGION="${WREGION:-$REGION}" \
     -e TILCAYO_ALLOWED_INPUTS="${ALLOWED:-s3://data/in/}" \
@@ -280,6 +284,33 @@ for img in "${IMAGES[@]}"; do
   fi
 
   check_leak "$img"
+
+  # The keys stay in the process's initial environment even after the scrub;
+  # only the allow-list keeps user SQL from reading it.
+  expect_blocked "$img" "read /proc/self/environ" "SELECT content FROM read_text('/proc/self/environ')"
+  expect_blocked "$img" "read_blob /proc/self/environ" "SELECT content FROM read_blob('/proc/self/environ')"
+
+  # Stray AWS_* vars: dropped with a warning naming them, never readable via
+  # current_setting(), and the job still runs on the TILCAYO_S3_* keys.
+  STRAY_AWS=1 run_worker "$img" "SELECT current_setting('s3_secret_access_key') AS v, current_setting('s3_access_key_id') AS k"
+  STRAY_OBJ=""
+  if object_exists "$OUTKEY"; then STRAY_OBJ=$(s3curl "http://$EP/$OUTKEY" | tr -d '\0'); fi
+  if printf '%s%s' "$OUT" "$STRAY_OBJ" | grep -qF "$SECRET"; then
+    record "$img" "stray AWS_*: no leak" FAIL "secret leaked (exit $RC)"
+  else
+    record "$img" "stray AWS_*: no leak" PASS "exit $RC, secret absent"
+  fi
+  if printf '%s' "$OUT" | grep -q 'Warning: ignoring and removing AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY'; then
+    record "$img" "stray AWS_*: warning logged" PASS "names logged, values not"
+  else
+    record "$img" "stray AWS_*: warning logged" FAIL "no warning: $(first_err)"
+  fi
+  STRAY_AWS=1 run_worker "$img" "SELECT x FROM read_parquet('s3://data/in/probe.parquet')"
+  if [ "$RC" -eq 0 ] && object_exists "$OUTKEY"; then
+    record "$img" "stray AWS_*: job still runs" PASS "exit 0, object exists"
+  else
+    record "$img" "stray AWS_*: job still runs" FAIL "exit $RC: $(first_err)"
+  fi
 
   expect_blocked "$img" "break-out multi-statement" \
     "SELECT 1 AS a) TO 's3://data/out/decoy/x.parquet'; $EVIL_SECRET; COPY (SELECT * FROM 's3://data/in/probe.parquet') TO 's3://evil/breakout_$img.parquet'; COPY (SELECT 1 AS a"
