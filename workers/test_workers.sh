@@ -23,6 +23,26 @@ cd "$(dirname "$0")"  # always run from workers/
 RUN=(docker run --rm --user "$(id -u):$(id -g)" --read-only -v /tmp
      --cap-drop ALL --security-opt no-new-privileges)
 
+# Results go to a per-run /out dir, as in store-free mode: the worker refuses
+# any other local OUTPUT_PATH directory.
+OUT_DIR=$(mktemp -d)
+trap 'rm -rf "$OUT_DIR"' EXIT
+
+# expect_error <name> <command...>: the command must exit 1 and its last
+# stderr line must be the `tilcayo-error: ` sentinel. Stops the script if not.
+expect_error() {
+  local name=$1 rc=0 err last
+  shift
+  err=$("$@" 2>&1 >/dev/null) || rc=$?
+  last=$(printf '%s\n' "$err" | tail -n 1)
+  if [ "$rc" -eq 1 ] && [[ "$last" == "tilcayo-error: "* ]]; then
+    echo "PASS: $name: ${last:0:120}"
+  else
+    echo "FAIL: $name: exit $rc, last stderr line: ${last:0:120}"
+    exit 1
+  fi
+}
+
 # ── Build ─────────────────────────────────────────────────────────────────────
 
 echo ""
@@ -134,12 +154,13 @@ echo "── Test 2: JOIN two CSVs → output.parquet"
   -v "$(pwd)/testdata:/data" \
   -e TILCAYO_ALLOWED_INPUTS=/data/ \
   -e QUERY="SELECT u.name, o.product, o.amount FROM read_csv('/data/users.csv') u JOIN read_csv('/data/orders.csv') o ON u.id = o.user_id ORDER BY u.name" \
-  -e OUTPUT_PATH="/data/output_join.parquet" \
+  -v "$OUT_DIR:/out" \
+  -e OUTPUT_PATH="/out/output_join.parquet" \
   tilcayo/worker-general:test
 
-echo "Wrote testdata/output_join.parquet — reading it back:"
+echo "Wrote output_join.parquet — reading it back:"
 "${RUN[@]}" \
-  -v "$(pwd)/testdata:/data" \
+  -v "$OUT_DIR:/data:ro" \
   -e TILCAYO_ALLOWED_INPUTS=/data/ \
   -e QUERY="SELECT * FROM read_parquet('/data/output_join.parquet')" \
   tilcayo/worker-general:test
@@ -147,16 +168,16 @@ echo "Wrote testdata/output_join.parquet — reading it back:"
 # ── Test 3: bad query exits 1
 echo ""
 echo "── Test 3: Bad query should exit 1"
-"${RUN[@]}" \
+expect_error "unknown table" "${RUN[@]}" \
   -v "$(pwd)/testdata:/data" \
   -e QUERY="SELECT * FROM nonexistent_table" \
-  tilcayo/worker-general:test && echo "FAIL: expected exit 1" || echo "PASS: exited 1 as expected"
+  tilcayo/worker-general:test
 
 # ── Test 4: missing QUERY env var exits 1
 echo ""
 echo "── Test 4: Missing QUERY env var should exit 1"
-"${RUN[@]}" \
-  tilcayo/worker-general:test && echo "FAIL: expected exit 1" || echo "PASS: exited 1 as expected"
+expect_error "missing QUERY" "${RUN[@]}" \
+  tilcayo/worker-general:test
 
 # =============================================================================
 # SPATIAL WORKER
@@ -192,10 +213,11 @@ echo "── Test 7: ST_Read → output Parquet"
   -v "$(pwd)/testdata:/data" \
   -e TILCAYO_ALLOWED_INPUTS=/data/ \
   -e QUERY="SELECT name, pop, geom FROM ST_Read('/data/cities.geojson') WHERE pop > 5000000" \
-  -e OUTPUT_PATH="/data/output_big_cities.parquet" \
+  -v "$OUT_DIR:/out" \
+  -e OUTPUT_PATH="/out/output_big_cities.parquet" \
   tilcayo/worker-spatial:test
 
-echo "Wrote testdata/output_big_cities.parquet"
+echo "Wrote output_big_cities.parquet"
 
 # ── Test 8: spatial join with CSV (mix formats)
 echo ""
@@ -252,6 +274,45 @@ echo "── Test 11: Full embed() similarity search (regenerates embeddings wit
     ORDER BY dist
   " \
   tilcayo/worker-ml:test
+
+# =============================================================================
+# FAILURE SENTINEL — every failure exits 1, last stderr line `tilcayo-error: `
+# =============================================================================
+
+echo ""
+echo "══════════════════════════════════════════"
+echo " FAILURE SENTINEL"
+echo "══════════════════════════════════════════"
+echo ""
+
+# ── Test 12: one case per exit path
+for img in spatial ml; do
+  expect_error "$img: missing QUERY" "${RUN[@]}" tilcayo/worker-$img:test
+done
+expect_error "unparsable SQL" "${RUN[@]}" \
+  -e QUERY="SELEC 1 FROM" \
+  tilcayo/worker-general:test
+expect_error "non-SELECT" "${RUN[@]}" \
+  -e QUERY="CREATE TABLE t(i INT)" \
+  tilcayo/worker-general:test
+expect_error "execution error (missing /data file)" "${RUN[@]}" \
+  -v "$(pwd)/testdata:/data" \
+  -e TILCAYO_ALLOWED_INPUTS=/data/ \
+  -e QUERY="SELECT * FROM read_csv('/data/does_not_exist.csv')" \
+  tilcayo/worker-general:test
+expect_error "bad TILCAYO_ALLOWED_INPUTS (/)" "${RUN[@]}" \
+  -e TILCAYO_ALLOWED_INPUTS=/ \
+  -e QUERY="SELECT 1" \
+  tilcayo/worker-general:test
+# Offline and not baked in, so loading the model fails inside embed().
+expect_error "ml: embed() error (unknown model)" "${RUN[@]}" \
+  -e EMBEDDING_MODEL=no-such-model \
+  -e QUERY="SELECT embed('x') AS e" \
+  tilcayo/worker-ml:test
+for img in general spatial ml; do
+  expect_error "$img: uncaught exception" docker run --rm --entrypoint python \
+    tilcayo/worker-$img:test -c "import storage; raise RuntimeError('boom')"
+done
 
 echo ""
 echo "==> All tests complete."

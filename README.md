@@ -63,7 +63,7 @@ curl -X POST "$TILCAYO_URL/jobs" \
 curl "$TILCAYO_URL/jobs/<job_id>"
 ```
 
-A job is `pending`, `running`, `succeeded`, `failed` or `cancelled`. A failed job includes the worker's error message. When it succeeds, the response includes a `result_url`.
+A job is `queued`, `running`, `succeeded`, `failed` or `cancelled`. A failed job reports why: a worker error with the worker's message, out of memory, timed out, or crashed. A cancelled job has its own state, not `failed`. When it succeeds, the response includes a `result_url`.
 
 **3. Download the result.**
 
@@ -84,6 +84,7 @@ Not decided yet: the exact JSON shape of the responses and webhook payload, and 
 ### Writing queries
 
 - **One `SELECT` per job.** Anything else (several statements, `COPY`, `CREATE`, `ATTACH`, `INSTALL`) is rejected and the job fails. Multi-statement pipelines may come later.
+- **Size limit.** SQL is limited to 128,000 bytes and may not contain NUL bytes. Larger queries are rejected when submitted.
 - **Local files** live under `/data`, the data folder the operator configures. Refer to them by that path: `read_csv('/data/sales/2026.csv')`, `read_parquet('/data/events/*.parquet')`, `ST_Read('/data/regions.geojson')`. Nothing outside `/data` is readable, and `/data` is read-only.
 - **Object storage** files are referred to as `s3://bucket/key`, and only from the locations the deployment allows. The operator sets those for the whole deployment; a request cannot add more.
 - **Mixing works.** One query can join a local CSV with Parquet in object storage.
@@ -112,9 +113,10 @@ The control plane reads all settings from its environment and passes what each w
 | `TILCAYO_S3_KEY_ID`, `TILCAYO_S3_SECRET` | `TILCAYO_RESULTS=s3`, or to read object storage | Static access keys | decided |
 | `TILCAYO_S3_REGION` | with the keys | Required, no default. The control plane refuses to start without it | decided |
 | `TILCAYO_S3_ENDPOINT`, `TILCAYO_S3_PUBLIC_ENDPOINT`, `TILCAYO_S3_URL_STYLE`, `TILCAYO_S3_USE_SSL` | depends on the provider | See [Storage](#storage) | decided |
-| Output bucket | `TILCAYO_RESULTS=s3` | Bucket results are written to, as `<bucket>/<job_id>/result.parquet` | name not decided |
-| Allowed object-storage inputs | to read object storage | Which buckets or prefixes queries may read, for every job | name not decided |
-| `TILCAYO_JOB_CPU`, `TILCAYO_JOB_MEMORY` | optional | CPU and memory limit of each worker | provisional |
+| `TILCAYO_OUTPUT_PREFIX` | `TILCAYO_RESULTS=s3` | Where results are written: `s3://bucket/` or `s3://bucket/path/`, ending in `/`. Each job writes `<prefix><job_id>/result.parquet`. Refused in store-free mode | decided |
+| `TILCAYO_INPUT_PREFIXES` | to read object storage | Comma-separated `s3://` prefixes queries may read, for every job, each ending in `/`. May not overlap the output prefix | decided |
+| `TILCAYO_IMAGE_<ENGINE>` | optional | Overrides the worker image for one engine, for example `TILCAYO_IMAGE_ML` | decided |
+| `TILCAYO_JOB_CPU`, `TILCAYO_JOB_MEMORY` | optional | CPU and memory limit of each worker. Defaults are per engine: 1 CPU each; 1 GiB for `general` and `spatial`, 4 GiB for `ml` (provisional until measured). When set, they override every engine, so setting memory also resizes `ml` | provisional |
 | `TILCAYO_MEMORY_FRACTION` | optional | Share of a worker's memory limit DuckDB may use before spilling to disk, default `0.5`. See [How workers run](#how-workers-run) | provisional |
 | `TILCAYO_MAX_CONCURRENT_JOBS` | optional, Docker mode | Jobs over the limit wait in a queue | provisional |
 | `TILCAYO_DOCKER_NETWORK` | Docker mode | Network workers join to reach the store. The control plane is not on it | provisional |
@@ -155,6 +157,8 @@ TILCAYO_S3_ENDPOINT=garage:3900
 TILCAYO_S3_PUBLIC_ENDPOINT=localhost:3900
 TILCAYO_S3_URL_STYLE=path
 TILCAYO_S3_USE_SSL=false
+TILCAYO_OUTPUT_PREFIX=s3://tilcayo-results/
+TILCAYO_INPUT_PREFIXES=s3://tilcayo-inputs/
 ```
 
 Things to know:
@@ -274,15 +278,15 @@ Keys are static access keys passed as `TILCAYO_S3_KEY_ID` and `TILCAYO_S3_SECRET
 
 Credentials are set up using DuckDB's secrets manager (`CREATE SECRET`) rather than the legacy `SET s3_*` approach, and the connection is locked after setup, so user-submitted SQL cannot read back or override them. The keys do remain in the worker's process environment. User SQL is kept away from it (for example `/proc/self/environ`) by the path allow-list, not by removing the variables. Anyone who can inspect the container can see them: in Kubernetes, inject them from a Secret with `secretKeyRef` so the values stay out of the pod spec.
 
-**Scoping access.** Where the provider allows it, give workers a key that is read-only on input locations and writable only where results go. Garage can only scope a key per bucket (read, write, owner), not per prefix, so on Garage keep inputs and outputs in separate buckets and give the key read-only access to the input bucket. This is recommended, not required: a job is a single `SELECT`, and no way is known for one to write anywhere but its own result. The workers' path checks would allow writes under an input prefix, though, so the key is the safety net if that ever changes.
+**Scoping access.** Where the provider allows it, give workers a key that is read-only on input locations and writable only where results go. Garage can only scope a key per bucket (read, write, owner), not per prefix, so on Garage keep inputs and outputs in separate buckets and give the key read-only access to the input bucket. A shared bucket with separate input and output prefixes passes Tilcayo's checks, but loses this per-bucket scoping, so use separate buckets. This is recommended, not required: a job is a single `SELECT`, and no way is known for one to write anywhere but its own result. The workers' path checks would allow writes under an input prefix, though, so the key is the safety net if that ever changes.
 
-**What the workers enforce.** A job must be exactly one `SELECT` statement. User SQL can only touch the output path and the input locations the worker is given (S3 prefixes, and `/data` when a data folder is configured). It cannot read any other local file, open HTTP URLs, attach databases, install extensions or create secrets. This is covered by `workers/test_security.sh`. On local paths, DuckDB itself refuses `..` and symlinks that lead outside an allowed folder. On object storage, `..` is not blocked by Tilcayo; MinIO and Garage refuse it because the request signature no longer matches.
+**What the workers enforce.** A job must be exactly one `SELECT` statement. User SQL can only touch the output path and the input locations the worker is given (S3 prefixes, and `/data` when a data folder is configured). It cannot read any other local file, open HTTP URLs, attach databases, install extensions or create secrets. A worker given any local path other than `/data` as an allowed input refuses it and fails the job. This is covered by `workers/test_security.sh`. On local paths, DuckDB itself refuses `..` and symlinks that lead outside an allowed folder. On object storage, `..` is not blocked by Tilcayo; MinIO and Garage refuse it because the request signature no longer matches.
 
 ### How workers run
 
 - **Non-root, locked down.** Workers run as the control plane's user (the images default to uid 65532), with a read-only root filesystem, all Linux capabilities dropped and no privilege escalation. In Kubernetes they meet the Pod Security "restricted" profile and get no service-account token.
 - **Spilling to disk.** DuckDB writes intermediate data to `/tmp/duckdb` once a query outgrows its memory limit. `/tmp` is a disk-backed volume (a Kubernetes `emptyDir`, a Docker volume), not tmpfs, because tmpfs counts against the worker's memory.
-- **Memory limit.** DuckDB uses `TILCAYO_MEMORY_FRACTION` (default `0.5`) of the worker's memory limit. Its real memory use runs well above that number, about 1.6x in tests on large sorts, and a worker that crosses its container limit is killed without an error message. The limit is read from cgroup v2; on older cgroup v1 hosts the worker logs a warning and DuckDB uses its own default.
+- **Memory limit.** DuckDB uses `TILCAYO_MEMORY_FRACTION` (default `0.5`) of the worker's memory limit. Its real memory use runs well above that number, about 1.6x in tests on large sorts, and a worker that crosses its container limit is killed without an error message. The limit is read from cgroup v2; on older cgroup v1 hosts the worker logs a warning and DuckDB uses its own default. In Docker mode swap is disabled for workers (the swap limit equals the memory limit), matching Kubernetes.
 - **Cancel and stop.** `tini` runs as PID 1 so a stop signal ends the worker at once.
 
 ---
