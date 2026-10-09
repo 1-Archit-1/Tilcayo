@@ -14,6 +14,9 @@
 #   STORE=minio|garage   store under test (default minio)
 #   URL_STYLE=path|vhost how workers address buckets (default path)
 #   BUILD=1              build the :test images first
+#   IMAGES="general ml"  images to attack (default: general spatial ml). Use a
+#                        subset while iterating; run all images on both stores
+#                        before shipping worker changes.
 #
 # The test key can read and write BOTH buckets (data and evil), like the MinIO
 # root user, so that "foreign bucket" probes are blocked by the worker and not
@@ -28,7 +31,11 @@ URL_STYLE=${URL_STYLE:-path}
 NET=tilsec-net
 S3=tilsec-s3
 CURL=curlimages/curl:latest
-IMAGES=(general spatial ml)
+CURL_BOX=tilsec-curl   # one long-lived curl container; `docker exec` is much cheaper than `docker run`
+read -r -a IMAGES <<< "${IMAGES:-general spatial ml}"
+for i in "${IMAGES[@]}"; do
+  case "$i" in general|spatial|ml) ;; *) echo "unknown image in IMAGES: $i" >&2; exit 2 ;; esac
+done
 
 case "$STORE" in
   minio)
@@ -68,7 +75,7 @@ EP="$HOST:$PORT"
 SIGV4="aws:amz:$REGION:s3"
 
 cleanup() {
-  docker rm -f "$S3" >/dev/null 2>&1
+  docker rm -f "$S3" "$CURL_BOX" >/dev/null 2>&1
   docker network rm "$NET" >/dev/null 2>&1
 }
 WORK_DIR=$(mktemp -d)
@@ -86,8 +93,12 @@ fi
 
 docker network create "$NET" >/dev/null || exit 1
 
+# $WORK_DIR is mounted at /seed so seed_put can upload files written there later.
+docker run -d --name "$CURL_BOX" --network "$NET" -v "$WORK_DIR:/seed:ro" \
+  --entrypoint sleep "$CURL" infinity >/dev/null || exit 1
+
 s3curl() {  # s3curl <curl args...>  (admin creds, inside the network)
-  docker run --rm --network "$NET" "$CURL" -s --user "$ADMIN:$SECRET" --aws-sigv4 "$SIGV4" "$@"
+  docker exec "$CURL_BOX" curl -s --user "$ADMIN:$SECRET" --aws-sigv4 "$SIGV4" "$@"
 }
 
 start_minio() {
@@ -156,8 +167,7 @@ con.execute(\"COPY (SELECT 42 AS x, 'probe' AS s) TO '/out/probe.parquet'\")
 con.execute(\"COPY (SELECT 1 AS id, ST_Point(1,2) AS geom) TO '/out/pts.geojson' (FORMAT GDAL, DRIVER 'GeoJSON')\")
 " || exit 1
 seed_put() {  # seed_put <local file> <bucket/key>
-  docker run --rm --network "$NET" -v "$SEED_DIR:/seed:ro" "$CURL" -s -o /dev/null -w '%{http_code}' \
-    --user "$ADMIN:$SECRET" --aws-sigv4 "$SIGV4" -T "/seed/$1" "http://$EP/$2"
+  s3curl -o /dev/null -w '%{http_code}' -T "/seed/$1" "http://$EP/$2"
 }
 seed_put probe.parquet data/in/probe.parquet >/dev/null
 seed_put pts.geojson   data/in/pts.geojson   >/dev/null
@@ -265,10 +275,11 @@ record() {  # record <image> <case> <PASS|FAIL|INFO> <detail>
   esac
 }
 
-# Prefer the line that names the error over DuckDB's trailing caret marker.
+# Prefer the line that names the error over DuckDB's trailing caret marker;
+# on a worker failure that is the `tilcayo-error: ` sentinel, printed last.
 first_err() {
   local l
-  l=$(printf '%s' "$OUT" | grep -E 'Error|HTTP|denied|forbidden' | tail -n 1 | cut -c1-90)
+  l=$(printf '%s' "$OUT" | grep -E '^tilcayo-error: |Error|HTTP|denied|forbidden' | tail -n 1 | cut -c1-90)
   [ -n "$l" ] || l=$(printf '%s' "$OUT" | grep -v '^\s*$' | tail -n 1 | cut -c1-90)
   printf '%s' "$l"
 }
@@ -321,6 +332,7 @@ for img in "${IMAGES[@]}"; do
   else
     record "$img" "positive control (read in/, write out)" FAIL "exit $RC: $(first_err)"
   fi
+  SIBLING_KEY="$OUTKEY"  # another job's result, for the sibling-read probe
   # A trailing '--' comment must not swallow the COPY's closing paren.
   run_worker "$img" "SELECT x FROM read_parquet('s3://data/in/probe.parquet') -- trailing comment"
   if [ "$RC" -eq 0 ] && object_exists "$OUTKEY"; then
@@ -380,6 +392,33 @@ for img in "${IMAGES[@]}"; do
 
   # DuckDB's own spill directory is not readable by user SQL.
   expect_blocked "$img" "glob spill dir /tmp/**"        "SELECT * FROM glob('/tmp/**')"
+
+  # Only a job's own output directory is allow-listed, not the output bucket:
+  # another job's result (written by the positive control) is out of reach.
+  if object_exists "$SIBLING_KEY"; then
+    expect_blocked "$img" "read sibling job's result" "SELECT * FROM read_parquet('s3://$SIBLING_KEY')"
+  else
+    record "$img" "read sibling job's result" FAIL "setup: s3://$SIBLING_KEY missing"
+  fi
+
+  # The worker refuses any local allow-list entry other than /data/, so a
+  # misconfigured prefix can never expose /proc/self/environ (the keys). A
+  # harmless query, so only the refusal at setup can make the job fail.
+  for bad in / /proc/ /tmp/; do
+    ALLOWED="$bad" expect_blocked "$img" "allowed inputs '$bad' refused" "SELECT 1 AS a"
+  done
+  # Same for OUTPUT_PATH, whose directory is allow-listed too: only /out/ or
+  # an s3:// prefix.
+  for bad in /proc/self/x.parquet /tmp/x.parquet; do
+    WOUT="$bad" expect_blocked "$img" "OUTPUT_PATH '${bad%/*}/' refused" "SELECT 1 AS a"
+  done
+
+  if [ "$img" = ml ]; then
+    # The single-SELECT guard parses the SQL after embed() is resolved.
+    expect_blocked "$img" "embed(): second statement"   "SELECT embed('x'); DROP TABLE t"
+    expect_blocked "$img" "embed(): COPY to foreign"    "SELECT embed('x'); COPY (SELECT 1 AS a) TO 's3://evil/embed_$img.parquet'"
+    expect_blocked "$img" "embed(): smuggled in string" "SELECT embed('a'') ; ATTACH ''x.db'' --')"
+  fi
 
   # ── Local files: store-free job, /data read-only, its own /out dir ──
   # Unlike S3, '..' and symlinks on local paths are checked by DuckDB itself.
@@ -535,7 +574,7 @@ PY
 )
 PRESIGNED=$(docker run --rm --entrypoint python tilcayo/worker-general:test -c "$PRESIGN_PY" \
   "$EP" "$REGION" "$ADMIN" "$SECRET" "/$OUTKEY")
-curl_net() { docker run --rm --network "$NET" "$CURL" -s "$@"; }
+curl_net() { docker exec "$CURL_BOX" curl -s "$@"; }
 PS_CODE=$(curl_net -o /dev/null -w '%{http_code}' "$PRESIGNED")
 PS_MAGIC=$(curl_net "$PRESIGNED" | head -c 4)
 LAST="${PRESIGNED: -1}"

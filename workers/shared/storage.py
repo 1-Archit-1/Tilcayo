@@ -21,10 +21,49 @@ CGROUP_MEMORY_MAX = '/sys/fs/cgroup/memory.max'
 DEFAULT_MEMORY_FRACTION = 0.5
 
 
+ERROR_SENTINEL = 'tilcayo-error: '
+
+# The cap is in bytes, not characters: the kubelet keeps the LAST 2048 bytes of
+# the log, so a sentinel longer than that loses its own prefix and the control
+# plane can no longer find it. Measured in bytes, 1024 leaves room for the
+# prefix, and multi-byte error text (DuckDB echoes user SQL) cannot overflow it.
+ERROR_SENTINEL_MAX_BYTES = 1024
+
+
 def fail(message: str):
-    """Print an error to stderr and exit 1 (every worker failure exits 1)."""
+    r"""Print an error to stderr and exit 1 (every worker failure exits 1).
+
+    The full message comes first, then one final line
+    `tilcayo-error: <message>`, with backslashes doubled, newlines written as
+    '\n' and carriage returns as '\r', truncated to 1024 bytes so the line
+    always fits the control plane's 2048-byte log tail. The control plane
+    parses only that last line of the tail, so it must be the last thing
+    printed.
+    """
+    # Buffered stdout is flushed at exit, after stderr; flush it now so it
+    # cannot land below the sentinel in the combined log.
+    sys.stdout.flush()
     print(message, file=sys.stderr)
+    one_line = (message.replace('\\', '\\\\').replace('\n', '\\n')
+                .replace('\r', '\\r').replace('\0', '\\0'))
+    # Truncate on encoded bytes, then decode leniently: cutting a multi-byte
+    # character in half would raise, and counting characters instead of bytes
+    # would let non-ASCII messages overrun the tail and lose the prefix.
+    one_line = one_line.encode('utf-8', 'replace')[:ERROR_SENTINEL_MAX_BYTES]
+    print(ERROR_SENTINEL + one_line.decode('utf-8', 'replace'),
+          file=sys.stderr, flush=True)
     sys.exit(1)
+
+
+def _fail_on_uncaught(exc_type, exc, tb):
+    """Print the usual traceback, then exit through fail()."""
+    sys.__excepthook__(exc_type, exc, tb)
+    fail(f"Error: unexpected worker failure: {exc_type.__name__}: {exc}")
+
+
+# Every worker failure must end with the sentinel line, including bugs that
+# raise outside the try blocks below; importing storage installs this hook.
+sys.excepthook = _fail_on_uncaught
 
 
 def _sql_str(value: str) -> str:
@@ -99,25 +138,43 @@ def configure_storage(con: duckdb.DuckDBPyConnection, extensions: list[str], cre
 def allowed_directories(output_path: str | None) -> list[str]:
     """
     Paths user SQL may touch once external access is disabled:
-      - the directory of OUTPUT_PATH (with trailing '/'), if set
-      - each comma-separated prefix in TILCAYO_ALLOWED_INPUTS (provisional
-        name); each must end in '/'. Empty by default.
+      - the directory of OUTPUT_PATH (with trailing '/'), if set: '/out/' or
+        's3://<bucket>/[path/]'
+      - each comma-separated prefix in TILCAYO_ALLOWED_INPUTS: exactly
+        '/data/', or 's3://<bucket>/[path/]' ending in '/'. Empty by default.
+
+    Anything else (e.g. '/', '/proc/', '/tmp/') raises ValueError: a local
+    directory covering /proc would expose /proc/self/environ, which still
+    holds the storage keys. The worker checks this itself rather than trusting
+    whoever composed its environment.
     """
     dirs = []
     if output_path:
         head, sep, _ = output_path.rpartition('/')
         if not sep or not head:
             raise ValueError(f"OUTPUT_PATH must include a directory: {output_path!r}")
-        dirs.append(head + '/')
+        out_dir = head + '/'
+        if out_dir != '/out/' and not _is_s3_prefix(out_dir):
+            raise ValueError("OUTPUT_PATH must be under '/out/' or "
+                             f"'s3://<bucket>/': {output_path!r}")
+        dirs.append(out_dir)
 
     for prefix in os.environ.get('TILCAYO_ALLOWED_INPUTS', '').split(','):
         prefix = prefix.strip()
         if not prefix:
             continue
-        if not prefix.endswith('/'):
-            raise ValueError(f"TILCAYO_ALLOWED_INPUTS entries must end in '/': {prefix!r}")
+        if prefix != '/data/' and not _is_s3_prefix(prefix):
+            raise ValueError("TILCAYO_ALLOWED_INPUTS entries must be '/data/' or "
+                             f"'s3://<bucket>/...' ending in '/': {prefix!r}")
         dirs.append(prefix)
     return dirs
+
+
+def _is_s3_prefix(prefix: str) -> bool:
+    """'s3://<non-empty bucket>/...' ending in '/'."""
+    if not prefix.startswith('s3://') or not prefix.endswith('/'):
+        return False
+    return bool(prefix[len('s3://'):].split('/', 1)[0])
 
 
 def harden_connection(con: duckdb.DuckDBPyConnection, output_path: str | None):

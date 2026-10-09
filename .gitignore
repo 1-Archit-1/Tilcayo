@@ -4,3 +4,4 @@ duckdb.zip
 *plan.md
 *PLAN.md
 tilvenv/
+__pycache__/

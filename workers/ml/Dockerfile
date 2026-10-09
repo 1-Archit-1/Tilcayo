@@ -25,19 +25,20 @@ RUN pip install --no-cache-dir \
 ENV TILCAYO_EXTENSION_DIR=/opt/duckdb/extensions
 RUN python -c "import duckdb, os; con = duckdb.connect(config={'extension_directory': os.environ['TILCAYO_EXTENSION_DIR']}); con.execute('INSTALL vss'); con.execute('INSTALL httpfs');"
 
-# Pre-download the default embedding model so the worker is fully offline-capable.
+# Pre-download the EMBEDDING_MODEL (the one place it is named) so the worker is
+# fully offline-capable; a different model means a different image.
 # The cache lives in /opt (readable by any uid), not in root's home.
 ENV HF_HOME=/opt/huggingface
 ENV EMBEDDING_MODEL="all-MiniLM-L6-v2"
-RUN python -c "from sentence_transformers import SentenceTransformer; SentenceTransformer('all-MiniLM-L6-v2')"
+RUN python -c "import os; from sentence_transformers import SentenceTransformer; SentenceTransformer(os.environ['EMBEDDING_MODEL'])"
 # Never call the Hub at runtime: the cache is read-only for the worker, so only
 # models baked into the image can be used anyway.
 ENV HF_HUB_OFFLINE=1
 
 ENV DUCKDB_EXTENSIONS="vss,httpfs"
 
-# Build context must be workers/ root (same as spatial) so shared/ is reachable
-COPY shared/ /shared/
+# Build context must be workers/ root (same as spatial) so shared/storage.py is reachable
+COPY shared/storage.py /storage.py
 COPY ml/entrypoint.py /entrypoint.py
 
 # Non-root by default; the control plane sets its own uid:gid at runtime.
