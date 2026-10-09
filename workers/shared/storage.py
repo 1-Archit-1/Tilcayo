@@ -22,25 +22,36 @@ DEFAULT_MEMORY_FRACTION = 0.5
 
 
 ERROR_SENTINEL = 'tilcayo-error: '
-ERROR_SENTINEL_MAX = 1024
+
+# The cap is in bytes, not characters: the kubelet keeps the LAST 2048 bytes of
+# the log, so a sentinel longer than that loses its own prefix and the control
+# plane can no longer find it. Measured in bytes, 1024 leaves room for the
+# prefix, and multi-byte error text (DuckDB echoes user SQL) cannot overflow it.
+ERROR_SENTINEL_MAX_BYTES = 1024
 
 
 def fail(message: str):
-    """
-    Print an error to stderr and exit 1 (every worker failure exits 1).
+    r"""Print an error to stderr and exit 1 (every worker failure exits 1).
 
     The full message comes first, then one final line
-    `tilcayo-error: <message>` with '\\' escaped as '\\\\', newlines as '\\n'
-    and carriage returns as '\\r', truncated to 1024 characters. The control plane parses only that
-    last line of the log tail, so it must be the last thing printed.
+    `tilcayo-error: <message>`, with backslashes doubled, newlines written as
+    '\n' and carriage returns as '\r', truncated to 1024 bytes so the line
+    always fits the control plane's 2048-byte log tail. The control plane
+    parses only that last line of the tail, so it must be the last thing
+    printed.
     """
     # Buffered stdout is flushed at exit, after stderr; flush it now so it
     # cannot land below the sentinel in the combined log.
     sys.stdout.flush()
     print(message, file=sys.stderr)
     one_line = (message.replace('\\', '\\\\').replace('\n', '\\n')
-                .replace('\r', '\\r'))[:ERROR_SENTINEL_MAX]
-    print(ERROR_SENTINEL + one_line, file=sys.stderr, flush=True)
+                .replace('\r', '\\r').replace('\0', '\\0'))
+    # Truncate on encoded bytes, then decode leniently: cutting a multi-byte
+    # character in half would raise, and counting characters instead of bytes
+    # would let non-ASCII messages overrun the tail and lose the prefix.
+    one_line = one_line.encode('utf-8', 'replace')[:ERROR_SENTINEL_MAX_BYTES]
+    print(ERROR_SENTINEL + one_line.decode('utf-8', 'replace'),
+          file=sys.stderr, flush=True)
     sys.exit(1)
 
 
