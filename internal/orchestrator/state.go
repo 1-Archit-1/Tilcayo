@@ -5,7 +5,7 @@ type State string
 
 // Exported constants for job states.
 const (
-	StateQueued    State = "queued"
+	StateQueued    State = "pending"
 	StateRunning   State = "running"
 	StateSucceeded State = "succeeded"
 	StateFailed    State = "failed"

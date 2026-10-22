@@ -6,9 +6,9 @@ func fromEnvOrDefault(envVar string, fallback string) string {
 	val := os.Getenv(envVar)
 	if val != "" {
 		return val
-	} else {
-		return fallback
 	}
+
+	return fallback
 }
 
 func FromEnv() Config {
