@@ -8,6 +8,6 @@ import (
 
 func main() {
 	conf := config.FromEnv()
-	currState := orchestrator.StateQueued
+	currState := orchestrator.StatePending
 	fmt.Println("Main", conf, currState)
 }

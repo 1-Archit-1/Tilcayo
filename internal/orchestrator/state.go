@@ -5,11 +5,11 @@ type State string
 
 // Exported constants for job states.
 const (
-	StatePending    State = "pending"
-	StateRunning    State = "running"
-	StateSucceeded  State = "succeeded"
-	StateFailed     State = "failed"
-	StateCancelled  State = "cancelled"
+	StatePending   State = "pending"
+	StateRunning   State = "running"
+	StateSucceeded State = "succeeded"
+	StateFailed    State = "failed"
+	StateCancelled State = "cancelled"
 )
 
 // IsTerminal returns true if the job has finished and reached an end state.
