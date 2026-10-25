@@ -107,14 +107,14 @@ The control plane reads all settings from its environment and passes what each w
 | Variable | Needed when | Meaning | Status |
 |---|---|---|---|
 | `TILCAYO_ORCHESTRATOR` | always | `docker` or `kubernetes` | decided |
-| `TILCAYO_RESULTS` | optional | `s3` (default) or `local`. `local` means store-free and is refused in Kubernetes mode | provisional |
-| `TILCAYO_RESULTS_DIR` | `TILCAYO_RESULTS=local` | Host folder for results. Each job gets its own subfolder, deleted after 1h | provisional |
+| `TILCAYO_RESULTS_MODE` | optional | `s3` (default) or `local`. `local` means store-free and is refused in Kubernetes mode | provisional |
+| `TILCAYO_RESULTS_DIR` | `TILCAYO_RESULTS_MODE=local` | Host folder for results. Each job gets its own subfolder, deleted after 1h | provisional |
 | `TILCAYO_DATA_SOURCE` | optional | The data folder mounted read-only at `/data`. Docker: an absolute host path. Kubernetes: the name of a PVC. Unset means no `/data` | provisional |
-| `TILCAYO_S3_KEY_ID`, `TILCAYO_S3_SECRET` | `TILCAYO_RESULTS=s3`, or to read object storage | Static access keys | decided |
+| `TILCAYO_S3_KEY_ID`, `TILCAYO_S3_SECRET` | `TILCAYO_RESULTS_MODE=s3`, or to read object storage | Static access keys | decided |
 | `TILCAYO_S3_REGION` | with the keys | Required, no default. The control plane refuses to start without it | decided |
 | `TILCAYO_S3_ENDPOINT`, `TILCAYO_S3_PUBLIC_ENDPOINT`, `TILCAYO_S3_URL_STYLE`, `TILCAYO_S3_USE_SSL` | depends on the provider | See [Storage](#storage) | decided |
-| `TILCAYO_OUTPUT_PREFIX` | `TILCAYO_RESULTS=s3` | Where results are written: `s3://bucket/` or `s3://bucket/path/`, ending in `/`. Each job writes `<prefix><job_id>/result.parquet`. Refused in store-free mode | decided |
-| `TILCAYO_INPUT_PREFIXES` | to read object storage | Comma-separated `s3://` prefixes queries may read, for every job, each ending in `/`. May not overlap the output prefix | decided |
+| `TILCAYO_S3_OUTPUT_PREFIX` | `TILCAYO_RESULTS_MODE=s3` | Where results are written: `s3://bucket/` or `s3://bucket/path/`, ending in `/`. Each job writes `<prefix><job_id>/result.parquet`. Refused in store-free mode | decided |
+| `TILCAYO_S3_INPUT_PREFIXES` | to read object storage | Comma-separated `s3://` prefixes queries may read, for every job, each ending in `/`. May not overlap the output prefix | decided |
 | `TILCAYO_IMAGE_<ENGINE>` | optional | Overrides the worker image for one engine, for example `TILCAYO_IMAGE_ML` | decided |
 | `TILCAYO_JOB_CPU`, `TILCAYO_JOB_MEMORY` | optional | CPU and memory limit of each worker. Defaults are per engine: 1 CPU each; 1 GiB for `general` and `spatial`, 4 GiB for `ml` (provisional until measured). When set, they override every engine, so setting memory also resizes `ml` | provisional |
 | `TILCAYO_MEMORY_FRACTION` | optional | Share of a worker's memory limit DuckDB may use before spilling to disk, default `0.5`. See [How workers run](#how-workers-run) | provisional |
@@ -135,12 +135,12 @@ cp orders.csv /srv/tilcayo/data/
 ```bash
 # tilcayo.env
 TILCAYO_ORCHESTRATOR=docker
-TILCAYO_RESULTS=local
+TILCAYO_RESULTS_MODE=local
 TILCAYO_RESULTS_DIR=/srv/tilcayo/results
 TILCAYO_DATA_SOURCE=/srv/tilcayo/data
 ```
 
-**With object storage.** Leave out `TILCAYO_RESULTS` and `TILCAYO_RESULTS_DIR`, keep `TILCAYO_DATA_SOURCE` if you also want local inputs, and add the store settings. The two keys go in their own file, which compose loads with `env_file` and Kubernetes turns into a Secret:
+**With object storage.** Leave out `TILCAYO_RESULTS_MODE` and `TILCAYO_RESULTS_DIR`, keep `TILCAYO_DATA_SOURCE` if you also want local inputs, and add the store settings. The two keys go in their own file, which compose loads with `env_file` and Kubernetes turns into a Secret:
 
 ```bash
 # s3.env  (secret: keep it out of version control)
@@ -157,8 +157,8 @@ TILCAYO_S3_ENDPOINT=garage:3900
 TILCAYO_S3_PUBLIC_ENDPOINT=localhost:3900
 TILCAYO_S3_URL_STYLE=path
 TILCAYO_S3_USE_SSL=false
-TILCAYO_OUTPUT_PREFIX=s3://tilcayo-results/
-TILCAYO_INPUT_PREFIXES=s3://tilcayo-inputs/
+TILCAYO_S3_OUTPUT_PREFIX=s3://tilcayo-results/
+TILCAYO_S3_INPUT_PREFIXES=s3://tilcayo-inputs/
 ```
 
 Things to know:
