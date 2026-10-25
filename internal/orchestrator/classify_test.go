@@ -1,8 +1,8 @@
 package orchestrator_test
 
 import (
-	"testing"
 	"github.com/1-Archit-1/Tilcayo/internal/orchestrator"
+	"testing"
 )
 
 func TestUnescapeSentinel(t *testing.T) {
@@ -14,6 +14,9 @@ func TestUnescapeSentinel(t *testing.T) {
 		{"line 1\\nline 2", "line 1\nline 2"},
 		{"windows\\r\\nline", "windows\r\nline"},
 		{"slash\\\\escaped", "slash\\escaped"},
+		{"nul\\0byte", "nul\x00byte"},
+		{"trailing backslash\\", "trailing backslash\\"},
+		{"escaped backslash then n\\\\n", "escaped backslash then n\\n"},
 	}
 
 	for _, tc := range cases {
@@ -72,6 +75,41 @@ func TestClassify(t *testing.T) {
 			logTail:    "Traceback (most recent call last):\nException: boom\n",
 			wantState:  orchestrator.StateFailed,
 			wantErrMsg: "worker failed without a message",
+		},
+		{
+			name:       "sentinel followed by a later warning is ignored",
+			exitCode:   1,
+			logTail:    "tilcayo-error: boom\nWARNING: cgroup v1\n",
+			wantState:  orchestrator.StateFailed,
+			wantErrMsg: "worker failed without a message",
+		},
+		{
+			name:       "last of two sentinel lines wins",
+			exitCode:   1,
+			logTail:    "tilcayo-error: fake echoed from user SQL\ntilcayo-error: real\n",
+			wantState:  orchestrator.StateFailed,
+			wantErrMsg: "real",
+		},
+		{
+			name:       "exit 1 with empty tail",
+			exitCode:   1,
+			logTail:    "",
+			wantState:  orchestrator.StateFailed,
+			wantErrMsg: "worker failed without a message",
+		},
+		{
+			name:       "CRLF endings and trailing blank lines",
+			exitCode:   1,
+			logTail:    "detail\r\ntilcayo-error: bad input\r\n\r\n\n",
+			wantState:  orchestrator.StateFailed,
+			wantErrMsg: "bad input",
+		},
+		{
+			name:       "escaped NUL in message",
+			exitCode:   1,
+			logTail:    "tilcayo-error: a\\0b\n",
+			wantState:  orchestrator.StateFailed,
+			wantErrMsg: "a\x00b",
 		},
 		{
 			name:       "worker crashed exit 139",

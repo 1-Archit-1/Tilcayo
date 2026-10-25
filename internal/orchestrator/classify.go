@@ -8,7 +8,8 @@ import (
 // ErrorSentinel is the prefix printed on the final stderr line by a failing worker.
 const ErrorSentinel = "tilcayo-error: "
 
-// UnescapeSentinel converts escaped characters (\n, \r, \\) back into raw characters.
+// UnescapeSentinel converts escaped characters (\n, \r, \0, \\) back into raw characters.
+// This mirrors fail() in workers/shared/storage.py, which escapes exactly these four.
 func UnescapeSentinel(s string) string {
 	var b strings.Builder
 	b.Grow(len(s))
@@ -21,6 +22,8 @@ func UnescapeSentinel(s string) string {
 				b.WriteByte('\n')
 			case 'r':
 				b.WriteByte('\r')
+			case '0':
+				b.WriteByte(0)
 			case '\\':
 				b.WriteByte('\\')
 			default:
