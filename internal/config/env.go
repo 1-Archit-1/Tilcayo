@@ -3,6 +3,7 @@ package config
 import (
 	"fmt"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 )
@@ -39,6 +40,16 @@ func getenv(key string) string {
 	return strings.TrimSpace(os.Getenv(key))
 }
 
+// cleanHostPath tidies an absolute path ("/var/data/" becomes "/var/data")
+// so a trailing slash is not an error. Anything else, such as a relative
+// path or a PVC name, is left as is for Validate to judge.
+func cleanHostPath(p string) string {
+	if filepath.IsAbs(p) {
+		return filepath.Clean(p)
+	}
+	return p
+}
+
 func fromEnvOrDefault(key, fallback string) string {
 	if val := getenv(key); val != "" {
 		return val
@@ -48,6 +59,8 @@ func fromEnvOrDefault(key, fallback string) string {
 
 // FromEnv loads the raw Config struct from environment variables.
 // An empty variable counts as unset, by design (Kubernetes often sets empty values).
+// Values are trimmed, absolute host paths are cleaned, and TILCAYO_JOB_CPU and
+// TILCAYO_JOB_MEMORY are parsed and range-checked here.
 // TILCAYO_S3_USE_SSL accepts what strconv.ParseBool does: 1 t T TRUE true True
 // 0 f F FALSE false False. Anything else, such as "off", is an error.
 func FromEnv() (Config, error) {
@@ -77,6 +90,24 @@ func FromEnv() (Config, error) {
 		useSSL = parsed
 	}
 
+	var jobCPU float64
+	if raw := getenv(EnvJobCPU); raw != "" {
+		parsed, err := parseCPU(raw)
+		if err != nil {
+			return Config{}, err
+		}
+		jobCPU = parsed
+	}
+
+	var jobMemory int64
+	if raw := getenv(EnvJobMemory); raw != "" {
+		parsed, err := parseMemoryBytes(raw)
+		if err != nil {
+			return Config{}, err
+		}
+		jobMemory = parsed
+	}
+
 	images := make(map[string]string)
 	for engine := range engines {
 		if img := getenv(imageEnvName(engine)); img != "" {
@@ -88,10 +119,10 @@ func FromEnv() (Config, error) {
 		Port:             fromEnvOrDefault(EnvPort, DefaultPort),
 		Orchestrator:     getenv(EnvOrchestrator),
 		ResultsMode:      resultsMode,
-		ResultsDir:       getenv(EnvResultsDir),
+		ResultsDir:       cleanHostPath(getenv(EnvResultsDir)),
 		OutputPrefix:     getenv(EnvS3OutputPrefix),
 		InputPrefixes:    inputPrefixes,
-		DataSource:       getenv(EnvDataSource),
+		DataSource:       cleanHostPath(getenv(EnvDataSource)),
 		S3KeyID:          Secret(getenv(EnvS3KeyID)),
 		S3Secret:         Secret(getenv(EnvS3Secret)),
 		S3Region:         getenv(EnvS3Region),
@@ -100,8 +131,8 @@ func FromEnv() (Config, error) {
 		S3URLStyle:       fromEnvOrDefault(EnvS3URLStyle, DefaultURLStyle),
 		S3UseSSL:         useSSL,
 		DockerNetwork:    getenv(EnvDockerNetwork),
-		JobCPU:           getenv(EnvJobCPU),
-		JobMemory:        getenv(EnvJobMemory),
+		JobCPU:           jobCPU,
+		JobMemoryBytes:   jobMemory,
 		Images:           images,
 	}, nil
 }
