@@ -8,9 +8,16 @@ import (
 // ErrorSentinel is the prefix printed on the final stderr line by a failing worker.
 const ErrorSentinel = "tilcayo-error: "
 
-// UnescapeSentinel converts escaped characters (\n, \r, \0, \\) back into raw characters.
+// Exit codes the orchestrator classifies, per ADR 0001.
+const (
+	exitWorkerError = 1   // worker called fail()
+	exitKilled      = 137 // SIGKILL: out of memory or timeout, told apart by OOMKilled
+	exitTerminated  = 143 // SIGTERM: cancel
+)
+
+// unescapeSentinel converts escaped characters (\n, \r, \0, \\) back into raw characters.
 // This mirrors fail() in workers/shared/storage.py, which escapes exactly these four.
-func UnescapeSentinel(s string) string {
+func unescapeSentinel(s string) string {
 	var b strings.Builder
 	b.Grow(len(s))
 	inEscape := false
@@ -43,31 +50,36 @@ func UnescapeSentinel(s string) string {
 	return b.String()
 }
 
+// lastLine returns the last non-blank line of tail with any trailing \r removed.
+// It returns "" if the tail has no non-blank line.
+func lastLine(tail string) string {
+	var last string
+	for _, line := range strings.Split(tail, "\n") {
+		line = strings.TrimRight(line, "\r")
+		if strings.TrimSpace(line) != "" {
+			last = line
+		}
+	}
+	return last
+}
+
 // Classify determines the job State and error message from orchestrator signals per ADR 0001.
 func Classify(exitCode int, oomKilled bool, logTail string) (State, string) {
-	if exitCode == 0 {
+	switch {
+	case exitCode == 0:
 		return StateSucceeded, ""
-	} else if exitCode == 137 && oomKilled {
+	case exitCode == exitKilled && oomKilled:
 		return StateFailed, "out of memory"
-	} else if exitCode == 137 && !oomKilled {
+	case exitCode == exitKilled:
 		return StateFailed, "timed out"
-	} else if exitCode == 143 {
+	case exitCode == exitTerminated:
 		return StateCancelled, ""
-	} else if exitCode == 1 {
-		var lastLine string
-		for _, line := range strings.Split(logTail, "\n") {
-			trimmed := strings.TrimRight(line, "\r")
-			if strings.TrimSpace(trimmed) != "" {
-				lastLine = trimmed
-			}
-		}
-
-		if strings.HasPrefix(lastLine, ErrorSentinel) {
-			trimmed := strings.TrimPrefix(lastLine, ErrorSentinel)
-			return StateFailed, UnescapeSentinel(trimmed)
+	case exitCode == exitWorkerError:
+		if msg, ok := strings.CutPrefix(lastLine(logTail), ErrorSentinel); ok {
+			return StateFailed, unescapeSentinel(msg)
 		}
 		return StateFailed, "worker failed without a message"
+	default:
+		return StateFailed, fmt.Sprintf("worker crashed (exit %d)", exitCode)
 	}
-
-	return StateFailed, fmt.Sprintf("worker crashed (exit %d)", exitCode)
 }
