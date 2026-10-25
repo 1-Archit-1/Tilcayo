@@ -859,9 +859,11 @@ func TestImageFor(t *testing.T) {
 
 	t.Run("each override applies to its own engine only", func(t *testing.T) {
 		cfg := validS3Config()
-		cfg.ImageGeneral = "custom-general:test"
-		cfg.ImageSpatial = "custom-spatial:test"
-		cfg.ImageML = "custom-ml:test"
+		cfg.Images = map[string]string{
+			config.EngineGeneral: "custom-general:test",
+			config.EngineSpatial: "custom-spatial:test",
+			config.EngineML:      "custom-ml:test",
+		}
 		want := map[string]string{
 			config.EngineGeneral: "custom-general:test",
 			config.EngineSpatial: "custom-spatial:test",
@@ -877,7 +879,7 @@ func TestImageFor(t *testing.T) {
 
 	t.Run("one override leaves the others at default", func(t *testing.T) {
 		cfg := validS3Config()
-		cfg.ImageGeneral = "custom-general:test"
+		cfg.Images = map[string]string{config.EngineGeneral: "custom-general:test"}
 		got, err := cfg.ImageFor(config.EngineML)
 		if want := "ghcr.io/1-archit-1/tilcayo-worker-ml:dev"; err != nil || got != want {
 			t.Errorf("got %q, %v; want %q", got, err, want)
@@ -996,9 +998,11 @@ func TestFromEnvAllSet(t *testing.T) {
 		DockerNetwork:    "tilcayo-net",
 		JobCPU:           "0.5",
 		JobMemory:        "512Mi",
-		ImageGeneral:     "img-general:1",
-		ImageSpatial:     "img-spatial:2",
-		ImageML:          "img-ml:3",
+		Images: map[string]string{
+			config.EngineGeneral: "img-general:1",
+			config.EngineSpatial: "img-spatial:2",
+			config.EngineML:      "img-ml:3",
+		},
 	}
 	if len(vars) != len(allEnvVars) {
 		t.Fatalf("test sets %d variables but allEnvVars has %d", len(vars), len(allEnvVars))
@@ -1043,6 +1047,7 @@ func TestFromEnvDefaults(t *testing.T) {
 		ResultsMode: "s3",
 		S3URLStyle:  "vhost",
 		S3UseSSL:    true,
+		Images:      map[string]string{}, // no TILCAYO_IMAGE_<ENGINE> set
 		// Orchestrator has no default: it stays "" and Validate rejects it.
 	}
 	if !reflect.DeepEqual(got, want) {

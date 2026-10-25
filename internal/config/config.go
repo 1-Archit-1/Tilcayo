@@ -10,38 +10,6 @@ import (
 	"strings"
 )
 
-// Version can be set at build time via -ldflags "-X ...".
-var Version = "dev"
-
-// Valid engines.
-const (
-	EngineGeneral = "general"
-	EngineSpatial = "spatial"
-	EngineML      = "ml"
-)
-
-// Application Defaults
-const (
-	DefaultPort                = "8080"
-	DefaultResultsMode         = "s3"
-	DefaultURLStyle            = "vhost"
-	DefaultCPU                 = 1.0
-	giB                  int64 = 1024 * 1024 * 1024
-	miB                  int64 = 1024 * 1024
-	DefaultMemoryGeneral       = 1 * giB
-	DefaultMemorySpatial       = 1 * giB
-	DefaultMemoryML            = 4 * giB // provisional (Item 13 measures it)
-)
-
-// Allowed range for TILCAYO_JOB_CPU (cores) and TILCAYO_JOB_MEMORY (bytes).
-// The floors keep a typo from becoming "no limit" or a limit Docker refuses.
-const (
-	minCPU    = 0.01
-	maxCPU    = 256
-	minMemory = 64 * miB
-	maxMemory = 1024 * giB // 1 Ti
-)
-
 var (
 	s3BucketRegex = regexp.MustCompile(`^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$`)
 
@@ -136,9 +104,10 @@ type Config struct {
 	DockerNetwork    string
 	JobCPU           string // optional override for every engine, e.g. "0.5" (from TILCAYO_JOB_CPU)
 	JobMemory        string // optional override for every engine, e.g. "512Mi" (from TILCAYO_JOB_MEMORY)
-	ImageGeneral     string
-	ImageSpatial     string
-	ImageML          string
+	// Images maps engine name to an override image (from TILCAYO_IMAGE_<ENGINE>).
+	// Only engines with an override are present. Treat as read-only after
+	// FromEnv: copies of Config share this map.
+	Images map[string]string
 }
 
 // AllowedInputs derives the directories and prefixes worker SQL is permitted to touch.
@@ -157,14 +126,11 @@ func (c Config) AllowedInputs() []string {
 // It works on a Config straight from FromEnv, and always succeeds for a known
 // engine once Validate has passed.
 func (c Config) ResourcesFor(engine string) (Resources, error) {
-	mem := DefaultMemoryGeneral
-	switch engine {
-	case EngineGeneral, EngineSpatial:
-	case EngineML:
-		mem = DefaultMemoryML
-	default:
+	spec, ok := engines[engine]
+	if !ok {
 		return Resources{}, fmt.Errorf("%w: %q", ErrUnknownEngine, engine)
 	}
+	mem := spec.DefaultMemory
 
 	cpu := DefaultCPU
 	if c.JobCPU != "" {
@@ -184,25 +150,16 @@ func (c Config) ResourcesFor(engine string) (Resources, error) {
 	return Resources{CPU: cpu, MemoryBytes: mem}, nil
 }
 
-// ImageFor returns the container image to run for the specified engine.
+// ImageFor returns the container image to run for the specified engine:
+// the TILCAYO_IMAGE_<ENGINE> override if set, else the default for Version.
 func (c Config) ImageFor(engine string) (string, error) {
-	switch engine {
-	case EngineGeneral:
-		if c.ImageGeneral != "" {
-			return c.ImageGeneral, nil
-		}
-	case EngineSpatial:
-		if c.ImageSpatial != "" {
-			return c.ImageSpatial, nil
-		}
-	case EngineML:
-		if c.ImageML != "" {
-			return c.ImageML, nil
-		}
-	default:
+	if _, ok := engines[engine]; !ok {
 		return "", fmt.Errorf("%w: %q", ErrUnknownEngine, engine)
 	}
-	return fmt.Sprintf("ghcr.io/1-archit-1/tilcayo-worker-%s:%s", engine, Version), nil
+	if img := c.Images[engine]; img != "" {
+		return img, nil
+	}
+	return fmt.Sprintf(defaultImageFormat, engine, Version), nil
 }
 
 // parseCPU parses a CPU count in cores. Beware: NaN slips through a plain
@@ -302,37 +259,58 @@ func (c Config) hasAnyS3Credentials() bool {
 }
 
 // Validate checks the configuration for consistency and safety at startup.
-// It has no side effects; it only reads c.
+// It has no side effects; it only reads c. The checks run in this order and
+// the first failure is returned.
 func (c Config) Validate() error {
-	// 1. Orchestrator
-	if c.Orchestrator != "docker" && c.Orchestrator != "kubernetes" {
-		return fmt.Errorf("%w: %s must be 'docker' or 'kubernetes', got %q", ErrInvalidOrchestrator, EnvOrchestrator, c.Orchestrator)
+	checks := []func() error{
+		c.validateModes,
+		c.validateLocalResults,
+		c.validateS3,
+		c.validateInputPrefixes,
+		c.validateDataSource,
+		c.validateResources,
 	}
-
-	// 2. Results Mode
-	if c.ResultsMode != "s3" && c.ResultsMode != "local" {
-		return fmt.Errorf("%w: %s must be 's3' or 'local', got %q", ErrInvalidMode, EnvResultsMode, c.ResultsMode)
-	}
-
-	// Store-free (local) is Docker only
-	if c.ResultsMode == "local" && c.Orchestrator != "docker" {
-		return fmt.Errorf("%w: local results mode is only supported with docker orchestrator", ErrInvalidMode)
-	}
-
-	if c.ResultsMode == "local" {
-		if c.OutputPrefix != "" {
-			return fmt.Errorf("%w: %s cannot be set in local mode", ErrOutputPrefixRefused, EnvS3OutputPrefix)
-		}
-		if c.ResultsDir == "" {
-			return fmt.Errorf("%w: %s is required when results mode is local", ErrMissingField, EnvResultsDir)
-		}
-		if err := validateHostPath(EnvResultsDir, c.ResultsDir); err != nil {
+	for _, check := range checks {
+		if err := check(); err != nil {
 			return err
 		}
 	}
+	return nil
+}
 
-	// 3. S3 Configuration
-	if c.ResultsMode == "s3" {
+// validateModes checks the orchestrator and results mode, and that they fit together.
+func (c Config) validateModes() error {
+	if c.Orchestrator != OrchestratorDocker && c.Orchestrator != OrchestratorKubernetes {
+		return fmt.Errorf("%w: %s must be 'docker' or 'kubernetes', got %q", ErrInvalidOrchestrator, EnvOrchestrator, c.Orchestrator)
+	}
+	if c.ResultsMode != ResultsS3 && c.ResultsMode != ResultsLocal {
+		return fmt.Errorf("%w: %s must be 's3' or 'local', got %q", ErrInvalidMode, EnvResultsMode, c.ResultsMode)
+	}
+	// Store-free (local) is Docker only
+	if c.ResultsMode == ResultsLocal && c.Orchestrator != OrchestratorDocker {
+		return fmt.Errorf("%w: local results mode is only supported with docker orchestrator", ErrInvalidMode)
+	}
+	return nil
+}
+
+// validateLocalResults checks the store-free settings. It does nothing in s3 mode.
+func (c Config) validateLocalResults() error {
+	if c.ResultsMode != ResultsLocal {
+		return nil
+	}
+	if c.OutputPrefix != "" {
+		return fmt.Errorf("%w: %s cannot be set in local mode", ErrOutputPrefixRefused, EnvS3OutputPrefix)
+	}
+	if c.ResultsDir == "" {
+		return fmt.Errorf("%w: %s is required when results mode is local", ErrMissingField, EnvResultsDir)
+	}
+	return validateHostPath(EnvResultsDir, c.ResultsDir)
+}
+
+// validateS3 checks the output prefix and credentials (required in s3 mode,
+// all-or-nothing in local mode) and the URL style.
+func (c Config) validateS3() error {
+	if c.ResultsMode == ResultsS3 {
 		if c.OutputPrefix == "" {
 			return fmt.Errorf("%w: %s", ErrMissingField, EnvS3OutputPrefix)
 		}
@@ -349,7 +327,7 @@ func (c Config) Validate() error {
 			return fmt.Errorf("%w: %s", ErrMissingField, EnvS3Secret)
 		}
 	} else if c.hasAnyS3Credentials() || len(c.InputPrefixes) > 0 {
-		// S2: Local mode S3 cross-checks
+		// Local mode: S3 is optional, but if any of it is used, all of it is needed.
 		if c.S3KeyID == "" {
 			return fmt.Errorf("%w: %s required for S3 access in local mode", ErrMissingField, EnvS3KeyID)
 		}
@@ -361,11 +339,14 @@ func (c Config) Validate() error {
 		}
 	}
 
-	if c.S3URLStyle != "vhost" && c.S3URLStyle != "path" {
+	if c.S3URLStyle != URLStyleVhost && c.S3URLStyle != URLStylePath {
 		return fmt.Errorf("%w: %s must be 'vhost' or 'path', got %q", ErrInvalidURLStyle, EnvS3URLStyle, c.S3URLStyle)
 	}
+	return nil
+}
 
-	// 4. Input Prefixes
+// validateInputPrefixes checks each input prefix and that none overlaps the output prefix.
+func (c Config) validateInputPrefixes() error {
 	for _, prefix := range c.InputPrefixes {
 		if err := validateS3Prefix(prefix); err != nil {
 			return fmt.Errorf("%s: %w", EnvS3InputPrefixes, err)
@@ -374,31 +355,38 @@ func (c Config) Validate() error {
 			return fmt.Errorf("%w: input prefix %q overlaps with output prefix %q", ErrPrefixOverlap, prefix, c.OutputPrefix)
 		}
 	}
+	return nil
+}
 
-	// 5. Data Source
-	if c.DataSource != "" {
-		if c.Orchestrator == "docker" {
-			if err := validateHostPath(EnvDataSource, c.DataSource); err != nil {
-				return err
-			}
-		} else if c.Orchestrator == "kubernetes" {
-			if len(c.DataSource) > 253 || !dnsSubdomainRegex.MatchString(c.DataSource) {
-				return fmt.Errorf("%w: %s in kubernetes must be a PVC name (lowercase letters, digits, '-' and '.', max 253), got %q", ErrInvalidPath, EnvDataSource, c.DataSource)
-			}
+// validateDataSource checks the data source for the orchestrator in use, and
+// that local results do not sit inside it.
+func (c Config) validateDataSource() error {
+	if c.DataSource == "" {
+		return nil
+	}
+	switch c.Orchestrator {
+	case OrchestratorDocker:
+		if err := validateHostPath(EnvDataSource, c.DataSource); err != nil {
+			return err
+		}
+	case OrchestratorKubernetes:
+		if len(c.DataSource) > 253 || !dnsSubdomainRegex.MatchString(c.DataSource) {
+			return fmt.Errorf("%w: %s in kubernetes must be a PVC name (lowercase letters, digits, '-' and '.', max 253), got %q", ErrInvalidPath, EnvDataSource, c.DataSource)
 		}
 	}
 
 	// Local results must not sit inside the data source (or contain it), or
 	// every worker could read other jobs' results through /data.
 	// Both paths are known to be absolute and clean here (local mode implies docker).
-	if c.ResultsMode == "local" && c.DataSource != "" && dirsOverlap(c.ResultsDir, c.DataSource) {
+	if c.ResultsMode == ResultsLocal && dirsOverlap(c.ResultsDir, c.DataSource) {
 		return fmt.Errorf("%w: %s %q and %s %q must not contain each other", ErrDirOverlap, EnvResultsDir, c.ResultsDir, EnvDataSource, c.DataSource)
 	}
-
-	// 6. Resources: ResourcesFor parses and range-checks the overrides.
-	if _, err := c.ResourcesFor(EngineGeneral); err != nil {
-		return err
-	}
-
 	return nil
+}
+
+// validateResources parses and range-checks the CPU and memory overrides.
+// Any known engine will do: the overrides are the same for all of them.
+func (c Config) validateResources() error {
+	_, err := c.ResourcesFor(EngineGeneral)
+	return err
 }
