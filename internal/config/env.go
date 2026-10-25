@@ -39,6 +39,9 @@ func fromEnvOrDefault(key, fallback string) string {
 }
 
 // FromEnv loads the raw Config struct from environment variables.
+// An empty variable counts as unset, by design (Kubernetes often sets empty values).
+// TILCAYO_S3_USE_SSL accepts what strconv.ParseBool does: 1 t T TRUE true True
+// 0 f F FALSE false False. Anything else, such as "off", is an error.
 func FromEnv() (Config, error) {
 	resultsMode := fromEnvOrDefault(EnvResultsMode, DefaultResultsMode)
 	publicEndpoint := strings.TrimSpace(os.Getenv(EnvS3PublicEndpoint))
@@ -68,7 +71,7 @@ func FromEnv() (Config, error) {
 
 	return Config{
 		Port:             fromEnvOrDefault(EnvPort, DefaultPort),
-		Orchestrator:     fromEnvOrDefault(EnvOrchestrator, DefaultOrchestrator),
+		Orchestrator:     strings.TrimSpace(os.Getenv(EnvOrchestrator)),
 		ResultsMode:      resultsMode,
 		ResultsDir:       strings.TrimSpace(os.Getenv(EnvResultsDir)),
 		OutputPrefix:     strings.TrimSpace(os.Getenv(EnvS3OutputPrefix)),
