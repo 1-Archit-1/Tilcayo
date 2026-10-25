@@ -1,14 +1,18 @@
 package config
 
 import (
+	"fmt"
 	"os"
+	"strconv"
 	"strings"
 )
 
 // Environment variable names
 const (
 	EnvPort             = "PORT"
+	EnvOrchestrator     = "TILCAYO_ORCHESTRATOR"
 	EnvResultsMode      = "TILCAYO_RESULTS_MODE"
+	EnvResultsDir       = "TILCAYO_RESULTS_DIR"
 	EnvS3OutputPrefix   = "TILCAYO_S3_OUTPUT_PREFIX"
 	EnvS3InputPrefixes  = "TILCAYO_S3_INPUT_PREFIXES"
 	EnvDataSource       = "TILCAYO_DATA_SOURCE"
@@ -27,24 +31,18 @@ const (
 	EnvImageML          = "TILCAYO_IMAGE_ML"
 )
 
-const (
-	defaultPort        = "8080"
-	defaultResultsMode = "s3"
-	defaultURLStyle    = "vhost"
-)
-
 func fromEnvOrDefault(key, fallback string) string {
-	if val := os.Getenv(key); val != "" {
+	if val := strings.TrimSpace(os.Getenv(key)); val != "" {
 		return val
 	}
 	return fallback
 }
 
-// FromEnv loads the Config struct from environment variables.
-func FromEnv() Config {
-	resultsMode := fromEnvOrDefault(EnvResultsMode, defaultResultsMode)
-	publicEndpoint := os.Getenv(EnvS3PublicEndpoint)
-	endpoint := os.Getenv(EnvS3Endpoint)
+// FromEnv loads the raw Config struct from environment variables.
+func FromEnv() (Config, error) {
+	resultsMode := fromEnvOrDefault(EnvResultsMode, DefaultResultsMode)
+	publicEndpoint := strings.TrimSpace(os.Getenv(EnvS3PublicEndpoint))
+	endpoint := strings.TrimSpace(os.Getenv(EnvS3Endpoint))
 	if publicEndpoint == "" {
 		publicEndpoint = endpoint
 	}
@@ -60,28 +58,46 @@ func FromEnv() Config {
 	}
 
 	useSSL := true
-	if ssl := strings.ToLower(os.Getenv(EnvS3UseSSL)); ssl == "false" || ssl == "0" || ssl == "no" {
-		useSSL = false
+	if rawSSL := strings.TrimSpace(os.Getenv(EnvS3UseSSL)); rawSSL != "" {
+		parsed, err := strconv.ParseBool(rawSSL)
+		if err != nil {
+			return Config{}, fmt.Errorf("%s: invalid boolean %q", EnvS3UseSSL, rawSSL)
+		}
+		useSSL = parsed
 	}
 
 	return Config{
-		Port:             fromEnvOrDefault(EnvPort, defaultPort),
+		Port:             fromEnvOrDefault(EnvPort, DefaultPort),
+		Orchestrator:     fromEnvOrDefault(EnvOrchestrator, DefaultOrchestrator),
 		ResultsMode:      resultsMode,
-		OutputPrefix:     os.Getenv(EnvS3OutputPrefix),
+		ResultsDir:       strings.TrimSpace(os.Getenv(EnvResultsDir)),
+		OutputPrefix:     strings.TrimSpace(os.Getenv(EnvS3OutputPrefix)),
 		InputPrefixes:    inputPrefixes,
-		DataSource:       os.Getenv(EnvDataSource),
-		S3KeyID:          os.Getenv(EnvS3KeyID),
-		S3Secret:         os.Getenv(EnvS3Secret),
-		S3Region:         os.Getenv(EnvS3Region),
+		DataSource:       strings.TrimSpace(os.Getenv(EnvDataSource)),
+		S3KeyID:          Secret(strings.TrimSpace(os.Getenv(EnvS3KeyID))),
+		S3Secret:         Secret(strings.TrimSpace(os.Getenv(EnvS3Secret))),
+		S3Region:         strings.TrimSpace(os.Getenv(EnvS3Region)),
 		S3Endpoint:       endpoint,
 		S3PublicEndpoint: publicEndpoint,
-		S3URLStyle:       fromEnvOrDefault(EnvS3URLStyle, defaultURLStyle),
+		S3URLStyle:       fromEnvOrDefault(EnvS3URLStyle, DefaultURLStyle),
 		S3UseSSL:         useSSL,
-		DockerNetwork:    os.Getenv(EnvDockerNetwork),
-		JobCPU:           os.Getenv(EnvJobCPU),
-		JobMemory:        os.Getenv(EnvJobMemory),
-		ImageGeneral:     os.Getenv(EnvImageGeneral),
-		ImageSpatial:     os.Getenv(EnvImageSpatial),
-		ImageML:          os.Getenv(EnvImageML),
+		DockerNetwork:    strings.TrimSpace(os.Getenv(EnvDockerNetwork)),
+		JobCPU:           strings.TrimSpace(os.Getenv(EnvJobCPU)),
+		JobMemory:        strings.TrimSpace(os.Getenv(EnvJobMemory)),
+		ImageGeneral:     strings.TrimSpace(os.Getenv(EnvImageGeneral)),
+		ImageSpatial:     strings.TrimSpace(os.Getenv(EnvImageSpatial)),
+		ImageML:          strings.TrimSpace(os.Getenv(EnvImageML)),
+	}, nil
+}
+
+// Load loads environment variables and validates them in one step (M2, S5).
+func Load() (Config, error) {
+	cfg, err := FromEnv()
+	if err != nil {
+		return Config{}, fmt.Errorf("loading config: %w", err)
 	}
+	if err := cfg.Validate(); err != nil {
+		return Config{}, fmt.Errorf("validating config: %w", err)
+	}
+	return cfg, nil
 }
