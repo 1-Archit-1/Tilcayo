@@ -361,3 +361,7 @@ STORE=garage URL_STYLE=vhost ./test_security.sh  # virtual-hosted addressing
 ```
 
 The script starts a throwaway store on a private Docker network, seeds some input files, and runs each attack and regression case through the real worker entrypoints. It prints a PASS/FAIL table and exits non-zero on any failure. `BUILD=1` rebuilds the worker images first; do that whenever worker code has changed, because stale `:test` images can hide a change. The script uses throwaway credentials and needs Docker only.
+
+## Contributions
+
+Contributions are welcome!
