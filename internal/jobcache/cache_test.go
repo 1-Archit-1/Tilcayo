@@ -58,55 +58,99 @@ func TestPutAndGet(t *testing.T) {
 	}
 }
 
-func TestUpdate(t *testing.T) {
+func TestUpdateUnknownJob(t *testing.T) {
 	c := jobcache.New()
-
-	// Update non-existent job
-	event := orchestrator.JobEvent{
+	job, changed, found := c.Update(orchestrator.JobEvent{
 		JobID: "job-ghost",
 		State: orchestrator.StateRunning,
-	}
-	if _, ok := c.Update(event); ok {
-		t.Fatalf("Update non-existent job returned ok=true, want false")
-	}
-
-	// Put job
-	_ = c.Put(jobcache.Job{ID: "job-2", Engine: "spatial", Query: "SELECT 2"})
-
-	// Transition to running
-	updated, ok := c.Update(orchestrator.JobEvent{
-		JobID: "job-2",
-		State: orchestrator.StateRunning,
 	})
-	if !ok || updated.State != orchestrator.StateRunning {
-		t.Fatalf("Update to running failed: ok=%v, state=%q", ok, updated.State)
+	if found || changed || job != (jobcache.Job{}) {
+		t.Fatalf("Update unknown job = (%+v, changed=%v, found=%v), want empty, false, false", job, changed, found)
+	}
+}
+
+func TestUpdate(t *testing.T) {
+	finished := time.Date(2026, 11, 1, 12, 0, 0, 0, time.UTC)
+	running := orchestrator.JobEvent{State: orchestrator.StateRunning}
+	succeeded := orchestrator.JobEvent{State: orchestrator.StateSucceeded, FinishedAt: finished}
+	failed := orchestrator.JobEvent{State: orchestrator.StateFailed, ExitCode: 1, Error: "bad SQL", FinishedAt: finished}
+	cancelled := orchestrator.JobEvent{State: orchestrator.StateCancelled, ExitCode: 137, FinishedAt: finished}
+	oomAfterCancel := orchestrator.JobEvent{State: orchestrator.StateFailed, ExitCode: 137, Error: "out of memory", FinishedAt: finished.Add(time.Second)}
+
+	tests := []struct {
+		name        string
+		events      []orchestrator.JobEvent
+		wantChanged []bool // one per event
+		want        jobcache.Job
+	}{
+		{
+			name:        "pending to running to succeeded",
+			events:      []orchestrator.JobEvent{running, succeeded},
+			wantChanged: []bool{true, true},
+			want:        jobcache.Job{State: orchestrator.StateSucceeded, FinishedAt: finished},
+		},
+		{
+			name:        "failed records exit code and error",
+			events:      []orchestrator.JobEvent{running, failed},
+			wantChanged: []bool{true, true},
+			want:        jobcache.Job{State: orchestrator.StateFailed, ExitCode: 1, Error: "bad SQL", FinishedAt: finished},
+		},
+		{
+			name:        "repeated state is not a change",
+			events:      []orchestrator.JobEvent{running, running},
+			wantChanged: []bool{true, false},
+			want:        jobcache.Job{State: orchestrator.StateRunning},
+		},
+		{
+			name:        "replayed terminal event after reconnect is not a change",
+			events:      []orchestrator.JobEvent{succeeded, succeeded},
+			wantChanged: []bool{true, false},
+			want:        jobcache.Job{State: orchestrator.StateSucceeded, FinishedAt: finished},
+		},
+		{
+			name:        "stale running after succeeded is ignored",
+			events:      []orchestrator.JobEvent{running, succeeded, running},
+			wantChanged: []bool{true, true, false},
+			want:        jobcache.Job{State: orchestrator.StateSucceeded, FinishedAt: finished},
+		},
+		{
+			name:        "container exit after cancel keeps cancelled",
+			events:      []orchestrator.JobEvent{running, cancelled, oomAfterCancel},
+			wantChanged: []bool{true, true, false},
+			want:        jobcache.Job{State: orchestrator.StateCancelled, ExitCode: 137, FinishedAt: finished},
+		},
+		{
+			name:        "empty state is ignored",
+			events:      []orchestrator.JobEvent{running, {}},
+			wantChanged: []bool{true, false},
+			want:        jobcache.Job{State: orchestrator.StateRunning},
+		},
 	}
 
-	// Transition to succeeded (terminal)
-	finishTime := time.Now()
-	updated, ok = c.Update(orchestrator.JobEvent{
-		JobID:      "job-2",
-		State:      orchestrator.StateSucceeded,
-		ExitCode:   0,
-		FinishedAt: finishTime,
-	})
-	if !ok {
-		t.Fatalf("Update to succeeded returned ok=false")
-	}
-	if updated.State != orchestrator.StateSucceeded {
-		t.Fatalf("State = %q, want %q", updated.State, orchestrator.StateSucceeded)
-	}
-	if updated.ExitCode != 0 {
-		t.Fatalf("ExitCode = %d, want 0", updated.ExitCode)
-	}
-	if !updated.FinishedAt.Equal(finishTime) {
-		t.Fatalf("FinishedAt = %v, want %v", updated.FinishedAt, finishTime)
-	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			c := jobcache.New()
+			if err := c.Put(jobcache.Job{ID: "job-1"}); err != nil {
+				t.Fatal(err)
+			}
+			tt.want.ID = "job-1"
 
-	// Verify Get sees the update
-	stored, ok := c.Get("job-2")
-	if !ok || stored.State != orchestrator.StateSucceeded {
-		t.Fatalf("Stored job state after terminal update = %q", stored.State)
+			for i, ev := range tt.events {
+				ev.JobID = "job-1"
+				_, changed, found := c.Update(ev)
+				if !found {
+					t.Fatalf("event %d (%q): found = false, want true", i, ev.State)
+				}
+				if changed != tt.wantChanged[i] {
+					t.Errorf("event %d (%q): changed = %v, want %v", i, ev.State, changed, tt.wantChanged[i])
+				}
+			}
+
+			got, _ := c.Get("job-1")
+			if got != tt.want {
+				t.Errorf("stored job = %+v, want %+v", got, tt.want)
+			}
+		})
 	}
 }
 
@@ -119,9 +163,15 @@ func TestDeleteAndList(t *testing.T) {
 	}
 
 	// Insert 3 jobs
-	_ = c.Put(jobcache.Job{ID: "job-a", Engine: "general"})
-	_ = c.Put(jobcache.Job{ID: "job-b", Engine: "spatial"})
-	_ = c.Put(jobcache.Job{ID: "job-c", Engine: "ml"})
+	for _, j := range []jobcache.Job{
+		{ID: "job-a", Engine: "general"},
+		{ID: "job-b", Engine: "spatial"},
+		{ID: "job-c", Engine: "ml"},
+	} {
+		if err := c.Put(j); err != nil {
+			t.Fatal(err)
+		}
+	}
 
 	if list := c.List(); len(list) != 3 {
 		t.Fatalf("List() returned %d items, want 3", len(list))
@@ -150,7 +200,9 @@ func TestDeleteAndList(t *testing.T) {
 
 func TestDefensiveCopy(t *testing.T) {
 	c := jobcache.New()
-	_ = c.Put(jobcache.Job{ID: "job-defensive", State: orchestrator.StatePending})
+	if err := c.Put(jobcache.Job{ID: "job-defensive", State: orchestrator.StatePending}); err != nil {
+		t.Fatal(err)
+	}
 
 	got, ok := c.Get("job-defensive")
 	if !ok {
@@ -180,11 +232,10 @@ func TestConcurrentAccess(t *testing.T) {
 			defer wg.Done()
 			for j := range jobsPerRoutine {
 				id := fmt.Sprintf("job-%d-%d", routineID, j)
-				_ = c.Put(jobcache.Job{
-					ID:     id,
-					Engine: "general",
-					Query:  "SELECT 1",
-				})
+				// t.Error, not t.Fatal: Fatal must only be called from the test goroutine.
+				if err := c.Put(jobcache.Job{ID: id, Engine: "general", Query: "SELECT 1"}); err != nil {
+					t.Error(err)
+				}
 			}
 		}(i)
 	}
@@ -209,7 +260,7 @@ func TestConcurrentAccess(t *testing.T) {
 			defer wg.Done()
 			for j := range jobsPerRoutine {
 				id := fmt.Sprintf("job-%d-%d", routineID, j)
-				_, _ = c.Update(orchestrator.JobEvent{
+				_, _, _ = c.Update(orchestrator.JobEvent{
 					JobID: id,
 					State: orchestrator.StateRunning,
 				})
