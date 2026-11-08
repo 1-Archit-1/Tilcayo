@@ -60,6 +60,12 @@ func TestValidate(t *testing.T) {
 		{name: "local mode refused in kubernetes", base: validLocalConfig,
 			modify: func(c *config.Config) { c.Orchestrator = "kubernetes" }, wantErr: "TILCAYO_RESULTS_MODE"},
 		{name: "docker without network", modify: func(c *config.Config) { c.DockerNetwork = "" }, wantErr: "TILCAYO_DOCKER_NETWORK"},
+		{name: "docker host network", modify: func(c *config.Config) { c.DockerNetwork = "host" }, wantErr: "user-defined network"},
+		{name: "docker default bridge", modify: func(c *config.Config) { c.DockerNetwork = "bridge" }, wantErr: "user-defined network"},
+		{name: "docker default alias", modify: func(c *config.Config) { c.DockerNetwork = "default" }, wantErr: "user-defined network"},
+		{name: "docker none network", modify: func(c *config.Config) { c.DockerNetwork = "none" }, wantErr: "user-defined network"},
+		{name: "docker container network", modify: func(c *config.Config) { c.DockerNetwork = "container:abc" }, wantErr: "user-defined network"},
+		{name: "docker network named like a mode", modify: func(c *config.Config) { c.DockerNetwork = "hostnet" }},
 		{name: "kubernetes needs no docker network", modify: func(c *config.Config) {
 			c.Orchestrator = "kubernetes"
 			c.DockerNetwork = ""
@@ -394,6 +400,7 @@ func TestFromEnvRejectsBadValues(t *testing.T) {
 		{"TILCAYO_JOB_MEMORY", "63Mi"},
 		{"TILCAYO_JOB_MEMORY", "17179869185Gi"}, // 2^34+1 Gi would wrap int64 to an in-range 1Gi
 		{"TILCAYO_MEMORY_FRACTION", "0"},
+		{"TILCAYO_MEMORY_FRACTION", "-0.5"},
 		{"TILCAYO_MEMORY_FRACTION", "1.01"},
 		{"TILCAYO_MEMORY_FRACTION", "NaN"},
 		{"TILCAYO_MEMORY_FRACTION", "half"},
@@ -405,6 +412,18 @@ func TestFromEnvRejectsBadValues(t *testing.T) {
 				t.Errorf("expected an error naming %s, got %v", tt.name, err)
 			}
 		})
+	}
+}
+
+func TestFromEnvMemoryFractionUpperBound(t *testing.T) {
+	// 1 is allowed (the worker accepts (0, 1]); only above it is rejected.
+	setEnv(t, map[string]string{"TILCAYO_MEMORY_FRACTION": "1"})
+	got, err := config.FromEnv()
+	if err != nil {
+		t.Fatalf("FromEnv failed: %v", err)
+	}
+	if got.MemoryFraction != 1 {
+		t.Errorf("MemoryFraction = %v; want 1", got.MemoryFraction)
 	}
 }
 

@@ -29,41 +29,63 @@ type DockerClient interface {
 	ImageInspect(ctx context.Context, imageID string, options ...client.ImageInspectOption) (client.ImageInspectResult, error)
 }
 
-// imageDefaultUser is the non-root uid:gid every worker image sets with USER.
-const imageDefaultUser = "65532:65532"
+// The non-root uid:gid every worker image sets with USER.
+const (
+	imageDefaultUID = 65532
+	imageDefaultGID = 65532
+)
 
-// How long Preflight waits for the daemon to answer. Variables so tests can
-// shorten them.
+// How long Preflight waits for the daemon to answer, and for each inspect
+// call after that. Variables so tests can shorten them.
 var (
 	pingTimeout       = 15 * time.Second
 	pingRetryInterval = time.Second
+	inspectTimeout    = 10 * time.Second
 )
 
 // DockerOrchestrator implements Orchestrator by running workers as Docker containers.
 type DockerOrchestrator struct {
-	cli  DockerClient
-	cfg  *config.Config
-	user string // uid:gid workers run as, from workerUser
+	cli          DockerClient
+	cfg          *config.Config
+	uid, gid     int                                   // workers run as uid:gid, from workerIDs
+	rootFallback bool                                  // the control plane is root, so workers use the image default
+	chown        func(name string, uid, gid int) error // os.Chown; replaced in tests
 }
 
-// NewDockerOrchestrator creates a new DockerOrchestrator.
+// NewDockerOrchestrator creates a new DockerOrchestrator for a control plane
+// running as the current process's uid:gid.
 func NewDockerOrchestrator(cli DockerClient, cfg *config.Config) *DockerOrchestrator {
+	return newDockerOrchestrator(cli, cfg, os.Getuid(), os.Getgid())
+}
+
+// newDockerOrchestrator takes the control plane's uid:gid, so tests can
+// exercise the root fallback without running as root.
+func newDockerOrchestrator(cli DockerClient, cfg *config.Config, cpUID, cpGID int) *DockerOrchestrator {
+	uid, gid := workerIDs(cpUID, cpGID)
 	return &DockerOrchestrator{
-		cli:  cli,
-		cfg:  cfg,
-		user: workerUser(os.Getuid(), os.Getgid()),
+		cli:          cli,
+		cfg:          cfg,
+		uid:          uid,
+		gid:          gid,
+		rootFallback: cpUID == 0,
+		chown:        os.Chown,
 	}
 }
 
-// workerUser returns the uid:gid workers run as: the control plane's own, so
+// workerIDs returns the uid:gid workers run as: the control plane's own, so
 // store-free results belong to the operator (issue #18). A root control plane
 // gets the image default instead, so workers never run as root: Docker has no
 // equivalent of Kubernetes' runAsNonRoot to catch it.
-func workerUser(uid, gid int) string {
+func workerIDs(uid, gid int) (int, int) {
 	if uid == 0 {
-		return imageDefaultUser
+		return imageDefaultUID, imageDefaultGID
 	}
-	return fmt.Sprintf("%d:%d", uid, gid)
+	return uid, gid
+}
+
+// user is the container User string.
+func (d *DockerOrchestrator) user() string {
+	return fmt.Sprintf("%d:%d", d.uid, d.gid)
 }
 
 // Preflight checks the daemon, the worker network and the worker images
@@ -76,17 +98,20 @@ func (d *DockerOrchestrator) Preflight(ctx context.Context, warn func(string)) e
 	}
 
 	network := d.cfg.DockerNetwork
-	if _, err := d.cli.NetworkInspect(ctx, network, client.NetworkInspectOptions{}); err != nil {
+	netCtx, cancel := context.WithTimeout(ctx, inspectTimeout)
+	_, err := d.cli.NetworkInspect(netCtx, network, client.NetworkInspectOptions{})
+	cancel()
+	if err != nil {
 		if cerrdefs.IsNotFound(err) {
-			return fmt.Errorf("%s=%q: network does not exist; create it with 'docker network create %s' or start the compose stack",
+			return fmt.Errorf("%s=%q: network does not exist; create it with 'docker network create %s'",
 				config.EnvDockerNetwork, network, network)
 		}
 		return fmt.Errorf("%s=%q: inspect network: %w", config.EnvDockerNetwork, network, err)
 	}
 
-	if os.Getuid() == 0 {
-		warn(fmt.Sprintf("the control plane runs as root, so workers run as the image default %s; files under %s must be readable by that uid",
-			imageDefaultUser, config.EnvDataSource))
+	if d.rootFallback {
+		warn(fmt.Sprintf("the control plane runs as root, so workers run as the image default %s; files under %s must be readable by that uid, and each job's results dir is handed to it",
+			d.user(), config.EnvDataSource))
 	}
 
 	// Pulling is not done here or in Run: a missing image only fails jobs
@@ -96,12 +121,15 @@ func (d *DockerOrchestrator) Preflight(ctx context.Context, warn func(string)) e
 		if err != nil {
 			return err
 		}
-		if _, err := d.cli.ImageInspect(ctx, image); err != nil {
+		imgCtx, cancel := context.WithTimeout(ctx, inspectTimeout)
+		_, err = d.cli.ImageInspect(imgCtx, image)
+		cancel()
+		if err != nil {
 			if cerrdefs.IsNotFound(err) {
 				warn(fmt.Sprintf("image %q for engine %q is not present locally; %s jobs fail until you run 'docker pull %s' or set %s%s",
 					image, engine, engine, image, config.EnvImagePrefix, strings.ToUpper(engine)))
 			} else {
-				warn(fmt.Sprintf("image %q for engine %q: inspect failed: %v", image, engine, err))
+				warn(fmt.Sprintf("image %q for engine %q: inspect failed, so %s jobs may fail: %v", image, engine, engine, err))
 			}
 		}
 	}
@@ -111,8 +139,8 @@ func (d *DockerOrchestrator) Preflight(ctx context.Context, warn func(string)) e
 // waitForDaemon pings the daemon until it answers or pingTimeout passes, so
 // a daemon that is still starting does not stop the control plane. The first
 // successful ping also negotiates the API version.
-func (d *DockerOrchestrator) waitForDaemon(ctx context.Context) error {
-	ctx, cancel := context.WithTimeout(ctx, pingTimeout)
+func (d *DockerOrchestrator) waitForDaemon(parent context.Context) error {
+	ctx, cancel := context.WithTimeout(parent, pingTimeout)
 	defer cancel()
 	for {
 		_, err := d.cli.Ping(ctx, client.PingOptions{NegotiateAPIVersion: true})
@@ -121,6 +149,9 @@ func (d *DockerOrchestrator) waitForDaemon(ctx context.Context) error {
 		}
 		select {
 		case <-ctx.Done():
+			if parent.Err() != nil {
+				return fmt.Errorf("waiting for the Docker daemon: %w", parent.Err())
+			}
 			return fmt.Errorf("cannot reach the Docker daemon after %s (check DOCKER_HOST and that the daemon is running): %w", pingTimeout, err)
 		case <-time.After(pingRetryInterval):
 		}
@@ -190,6 +221,15 @@ func (d *DockerOrchestrator) Run(ctx context.Context, jobID string, spec JobSpec
 		if err := os.MkdirAll(outDir, 0o755); err != nil {
 			return fmt.Errorf("create results dir: %w", err)
 		}
+		// A root control plane creates the dir as root:root, which the
+		// 65532 worker cannot write to. Hand only this job's dir over; root
+		// can still serve and delete what the worker writes.
+		if d.rootFallback {
+			if err := d.chown(outDir, d.uid, d.gid); err != nil {
+				_ = os.Remove(outDir)
+				return fmt.Errorf("hand results dir to worker %s: %w", d.user(), err)
+			}
+		}
 		mounts = append(mounts, mount.Mount{
 			Type:   mount.TypeBind,
 			Source: outDir,
@@ -199,7 +239,7 @@ func (d *DockerOrchestrator) Run(ctx context.Context, jobID string, spec JobSpec
 
 	containerCfg := &container.Config{
 		Image: image,
-		User:  d.user,
+		User:  d.user(),
 		Env:   env,
 		Labels: map[string]string{
 			"tilcayo.io/job-id":            jobID,

@@ -263,11 +263,25 @@ func (c Config) validateModes() error {
 	}
 	// No fallback to Docker's default bridge: it has no container-name DNS
 	// and lets workers reach every other container on it (issue #9).
-	if c.Orchestrator == OrchestratorDocker && c.DockerNetwork == "" {
-		return fmt.Errorf("%s is required when %s=docker", EnvDockerNetwork, EnvOrchestrator)
+	if c.Orchestrator == OrchestratorDocker {
+		if c.DockerNetwork == "" {
+			return fmt.Errorf("%s is required when %s=docker", EnvDockerNetwork, EnvOrchestrator)
+		}
+		// Docker's built-in network modes all exist, so Preflight would
+		// accept them: "host" puts workers on the host's localhost, next to
+		// the control plane; "bridge"/"default" is the shared default
+		// network; "none" has no way to reach a store. "container:<id>"
+		// would share another container's network.
+		if builtinNetworks[c.DockerNetwork] || strings.HasPrefix(c.DockerNetwork, "container:") {
+			return fmt.Errorf("%s=%q: use a user-defined network (docker network create tilcayo), not a built-in network mode",
+				EnvDockerNetwork, c.DockerNetwork)
+		}
 	}
 	return nil
 }
+
+// builtinNetworks are Docker's network modes that are not user-defined networks.
+var builtinNetworks = map[string]bool{"host": true, "bridge": true, "default": true, "none": true}
 
 // validateLocalResults checks the store-free settings. It does nothing in s3 mode.
 func (c Config) validateLocalResults() error {

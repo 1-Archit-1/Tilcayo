@@ -34,6 +34,7 @@ type mockDockerClient struct {
 	pingCalls     int
 	failNetwork   error
 	missingImages map[string]bool
+	failImage     error // every ImageInspect fails with this
 	inspected     []string
 }
 
@@ -51,6 +52,9 @@ func (m *mockDockerClient) NetworkInspect(ctx context.Context, id string, opts c
 
 func (m *mockDockerClient) ImageInspect(ctx context.Context, image string, opts ...client.ImageInspectOption) (client.ImageInspectResult, error) {
 	m.inspected = append(m.inspected, image)
+	if m.failImage != nil {
+		return client.ImageInspectResult{}, m.failImage
+	}
 	if m.missingImages[image] {
 		return client.ImageInspectResult{}, fmt.Errorf("no such image: %s: %w", image, cerrdefs.ErrNotFound)
 	}
@@ -95,7 +99,7 @@ func TestDockerOrchestrator_Run_S3Success(t *testing.T) {
 	}
 
 	mock := &mockDockerClient{}
-	orch := NewDockerOrchestrator(mock, cfg)
+	orch := newDockerOrchestrator(mock, cfg, 1000, 1000)
 
 	jobID := "job-xyz-987"
 	spec := JobSpec{
@@ -114,9 +118,8 @@ func TestDockerOrchestrator_Run_S3Success(t *testing.T) {
 	}
 
 	// Verify User
-	expectedUser := workerUser(os.Getuid(), os.Getgid()) // the rule itself is TestWorkerUser
-	if mock.createdConfig.User != expectedUser {
-		t.Errorf("User = %q; want %q", mock.createdConfig.User, expectedUser)
+	if mock.createdConfig.User != "1000:1000" {
+		t.Errorf("User = %q; want the control plane's 1000:1000", mock.createdConfig.User)
 	}
 
 	// Verify Labels
@@ -462,20 +465,121 @@ func TestDockerOrchestrator_Run_InvalidResultsMode(t *testing.T) {
 	}
 }
 
-func TestWorkerUser(t *testing.T) {
-	tests := []struct {
-		uid, gid int
-		want     string
-	}{
-		{1000, 1000, "1000:1000"},
-		{1000, 0, "1000:0"},
-		{0, 0, "65532:65532"},    // root control plane: workers never run as root
-		{0, 1000, "65532:65532"}, // uid 0 is root whatever the group
+func TestWorkerIDs(t *testing.T) {
+	tests := []struct{ uid, gid, wantUID, wantGID int }{
+		{1000, 1000, 1000, 1000},
+		{1000, 0, 1000, 0},
+		{0, 0, 65532, 65532},    // root control plane: workers never run as root
+		{0, 1000, 65532, 65532}, // uid 0 is root whatever the group
 	}
 	for _, tt := range tests {
-		if got := workerUser(tt.uid, tt.gid); got != tt.want {
-			t.Errorf("workerUser(%d, %d) = %q; want %q", tt.uid, tt.gid, got, tt.want)
+		if uid, gid := workerIDs(tt.uid, tt.gid); uid != tt.wantUID || gid != tt.wantGID {
+			t.Errorf("workerIDs(%d, %d) = %d:%d; want %d:%d", tt.uid, tt.gid, uid, gid, tt.wantUID, tt.wantGID)
 		}
+	}
+}
+
+type chownCall struct {
+	path     string
+	uid, gid int
+}
+
+// rootLocalOrchestrator is a store-free orchestrator for a root control plane,
+// with chown recorded instead of performed (the tests do not run as root).
+func rootLocalOrchestrator(t *testing.T, mock *mockDockerClient, chownErr error) (*DockerOrchestrator, string, *[]chownCall) {
+	t.Helper()
+	results := t.TempDir()
+	cfg := &config.Config{ResultsMode: "local", ResultsDir: results, DockerNetwork: "tilcayo-net", MemoryFraction: 0.5}
+	orch := newDockerOrchestrator(mock, cfg, 0, 0)
+	var calls []chownCall
+	orch.chown = func(path string, uid, gid int) error {
+		calls = append(calls, chownCall{path, uid, gid})
+		return chownErr
+	}
+	return orch, results, &calls
+}
+
+func TestDockerOrchestrator_Run_RootHandsResultsDirToWorker(t *testing.T) {
+	mock := &mockDockerClient{}
+	orch, results, calls := rootLocalOrchestrator(t, mock, nil)
+
+	if err := orch.Run(context.Background(), "job-root", JobSpec{Engine: "general", Query: "SELECT 1"}); err != nil {
+		t.Fatalf("unexpected Run error: %v", err)
+	}
+	if mock.createdConfig.User != "65532:65532" {
+		t.Errorf("User = %q; want 65532:65532 for a root control plane", mock.createdConfig.User)
+	}
+	want := []chownCall{{filepath.Join(results, "job-root"), 65532, 65532}}
+	if !slices.Equal(*calls, want) {
+		t.Errorf("chown calls = %v; want %v", *calls, want)
+	}
+}
+
+func TestDockerOrchestrator_Run_NonRootDoesNotChown(t *testing.T) {
+	mock := &mockDockerClient{}
+	cfg := &config.Config{ResultsMode: "local", ResultsDir: t.TempDir(), DockerNetwork: "tilcayo-net", MemoryFraction: 0.5}
+	orch := newDockerOrchestrator(mock, cfg, 1000, 1000)
+	orch.chown = func(path string, uid, gid int) error {
+		t.Errorf("chown(%q, %d, %d) called for a non-root control plane", path, uid, gid)
+		return nil
+	}
+	if err := orch.Run(context.Background(), "job-user", JobSpec{Engine: "general", Query: "SELECT 1"}); err != nil {
+		t.Fatalf("unexpected Run error: %v", err)
+	}
+}
+
+func TestDockerOrchestrator_Run_ChownFailure(t *testing.T) {
+	mock := &mockDockerClient{}
+	orch, results, _ := rootLocalOrchestrator(t, mock, errors.New("operation not permitted"))
+
+	err := orch.Run(context.Background(), "job-chown", JobSpec{Engine: "general", Query: "SELECT 1"})
+	if err == nil || !strings.Contains(err.Error(), "operation not permitted") {
+		t.Fatalf("err = %v; want the chown error", err)
+	}
+	if mock.createdConfig != nil {
+		t.Errorf("container created after chown failed")
+	}
+	if _, err := os.Stat(filepath.Join(results, "job-chown")); !os.IsNotExist(err) {
+		t.Errorf("results dir not removed after chown failed: %v", err)
+	}
+}
+
+func TestPreflight_RootWarns(t *testing.T) {
+	shortPing(t)
+	var warnings []string
+	orch := newDockerOrchestrator(&mockDockerClient{}, preflightConfig(), 0, 0)
+	if err := orch.Preflight(context.Background(), func(s string) { warnings = append(warnings, s) }); err != nil {
+		t.Fatalf("unexpected Preflight error: %v", err)
+	}
+	if len(warnings) != 1 || !strings.Contains(warnings[0], "root") || !strings.Contains(warnings[0], "65532:65532") {
+		t.Errorf("warnings = %v; want one root warning naming 65532:65532", warnings)
+	}
+}
+
+func TestPreflight_ImageInspectErrorWarns(t *testing.T) {
+	shortPing(t)
+	mock := &mockDockerClient{failImage: errors.New("daemon busy")}
+	var warnings []string
+	if err := newDockerOrchestrator(mock, preflightConfig(), 1000, 1000).Preflight(context.Background(), func(s string) { warnings = append(warnings, s) }); err != nil {
+		t.Fatalf("an inspect error must only warn, got: %v", err)
+	}
+	if len(warnings) != len(config.Engines()) {
+		t.Fatalf("warnings = %v; want one per engine", warnings)
+	}
+	for _, w := range warnings {
+		if !strings.Contains(w, "inspect failed") || !strings.Contains(w, "daemon busy") || strings.Contains(w, "not present locally") {
+			t.Errorf("warning %q should report the inspect error, not a missing image", w)
+		}
+	}
+}
+
+func TestPreflight_ParentCancelled(t *testing.T) {
+	shortPing(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	err := newDockerOrchestrator(&mockDockerClient{pingFailures: 1 << 30}, preflightConfig(), 1000, 1000).Preflight(ctx, func(string) {})
+	if !errors.Is(err, context.Canceled) || strings.Contains(err.Error(), "cannot reach") {
+		t.Errorf("err = %v; want context.Canceled, not 'cannot reach'", err)
 	}
 }
 
