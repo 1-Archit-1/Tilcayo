@@ -9,7 +9,9 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"time"
 
+	cerrdefs "github.com/containerd/errdefs"
 	"github.com/moby/moby/api/types/container"
 	"github.com/moby/moby/api/types/mount"
 	"github.com/moby/moby/client"
@@ -27,6 +29,32 @@ type mockDockerClient struct {
 	removeCtx     context.Context
 	failCreate    error
 	failStart     error
+
+	pingFailures  int // Ping fails this many times, then succeeds
+	pingCalls     int
+	failNetwork   error
+	missingImages map[string]bool
+	inspected     []string
+}
+
+func (m *mockDockerClient) Ping(ctx context.Context, opts client.PingOptions) (client.PingResult, error) {
+	m.pingCalls++
+	if m.pingCalls <= m.pingFailures {
+		return client.PingResult{}, errors.New("connection refused")
+	}
+	return client.PingResult{}, nil
+}
+
+func (m *mockDockerClient) NetworkInspect(ctx context.Context, id string, opts client.NetworkInspectOptions) (client.NetworkInspectResult, error) {
+	return client.NetworkInspectResult{}, m.failNetwork
+}
+
+func (m *mockDockerClient) ImageInspect(ctx context.Context, image string, opts ...client.ImageInspectOption) (client.ImageInspectResult, error) {
+	m.inspected = append(m.inspected, image)
+	if m.missingImages[image] {
+		return client.ImageInspectResult{}, fmt.Errorf("no such image: %s: %w", image, cerrdefs.ErrNotFound)
+	}
+	return client.ImageInspectResult{}, nil
 }
 
 func (m *mockDockerClient) ContainerCreate(ctx context.Context, opts client.ContainerCreateOptions) (client.ContainerCreateResult, error) {
@@ -53,16 +81,17 @@ func (m *mockDockerClient) ContainerRemove(ctx context.Context, containerID stri
 
 func TestDockerOrchestrator_Run_S3Success(t *testing.T) {
 	cfg := &config.Config{
-		ResultsMode:   "s3",
-		OutputPrefix:  "s3://my-bucket/results/",
-		InputPrefixes: []string{"s3://input-bucket/data/"},
-		DockerNetwork: "tilcayo-net",
-		S3KeyID:       "test-key",
-		S3Secret:      "test-secret",
-		S3Region:      "us-east-1",
-		S3Endpoint:    "http://minio:9000",
-		S3URLStyle:    "path",
-		S3UseSSL:      false,
+		ResultsMode:    "s3",
+		OutputPrefix:   "s3://my-bucket/results/",
+		InputPrefixes:  []string{"s3://input-bucket/data/"},
+		DockerNetwork:  "tilcayo-net",
+		S3KeyID:        "test-key",
+		S3Secret:       "test-secret",
+		S3Region:       "us-east-1",
+		S3Endpoint:     "http://minio:9000",
+		S3URLStyle:     "path",
+		S3UseSSL:       false,
+		MemoryFraction: 0.25, // not the default, so a hardcoded value would fail
 	}
 
 	mock := &mockDockerClient{}
@@ -85,7 +114,7 @@ func TestDockerOrchestrator_Run_S3Success(t *testing.T) {
 	}
 
 	// Verify User
-	expectedUser := fmt.Sprintf("%d:%d", os.Getuid(), os.Getgid())
+	expectedUser := workerUser(os.Getuid(), os.Getgid()) // the rule itself is TestWorkerUser
 	if mock.createdConfig.User != expectedUser {
 		t.Errorf("User = %q; want %q", mock.createdConfig.User, expectedUser)
 	}
@@ -103,7 +132,7 @@ func TestDockerOrchestrator_Run_S3Success(t *testing.T) {
 		"QUERY":                   "SELECT 42",
 		"OUTPUT_PATH":             "s3://my-bucket/results/job-xyz-987/result.parquet",
 		"TILCAYO_ALLOWED_INPUTS":  "s3://input-bucket/data/",
-		"TILCAYO_MEMORY_FRACTION": "0.5",
+		"TILCAYO_MEMORY_FRACTION": "0.25",
 		"TILCAYO_S3_KEY_ID":       "test-key",
 		"TILCAYO_S3_SECRET":       "test-secret",
 		"TILCAYO_S3_REGION":       "us-east-1",
@@ -430,5 +459,118 @@ func TestDockerOrchestrator_Run_InvalidResultsMode(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "invalid ResultsMode") {
 		t.Errorf("error %q should mention invalid ResultsMode", err.Error())
+	}
+}
+
+func TestWorkerUser(t *testing.T) {
+	tests := []struct {
+		uid, gid int
+		want     string
+	}{
+		{1000, 1000, "1000:1000"},
+		{1000, 0, "1000:0"},
+		{0, 0, "65532:65532"},    // root control plane: workers never run as root
+		{0, 1000, "65532:65532"}, // uid 0 is root whatever the group
+	}
+	for _, tt := range tests {
+		if got := workerUser(tt.uid, tt.gid); got != tt.want {
+			t.Errorf("workerUser(%d, %d) = %q; want %q", tt.uid, tt.gid, got, tt.want)
+		}
+	}
+}
+
+// preflightConfig names an image override so the test can tell images apart.
+func preflightConfig() *config.Config {
+	return &config.Config{
+		DockerNetwork: "tilcayo-net",
+		Images:        map[string]string{"general": "worker-general:test"},
+	}
+}
+
+func shortPing(t *testing.T) {
+	t.Helper()
+	oldTimeout, oldInterval := pingTimeout, pingRetryInterval
+	pingTimeout, pingRetryInterval = 200*time.Millisecond, 10*time.Millisecond
+	t.Cleanup(func() { pingTimeout, pingRetryInterval = oldTimeout, oldInterval })
+}
+
+func TestPreflight_OK(t *testing.T) {
+	shortPing(t)
+	mock := &mockDockerClient{pingFailures: 2} // daemon still starting
+	var warnings []string
+	err := NewDockerOrchestrator(mock, preflightConfig()).Preflight(context.Background(), func(s string) { warnings = append(warnings, s) })
+	if err != nil {
+		t.Fatalf("unexpected Preflight error: %v", err)
+	}
+	if mock.pingCalls != 3 {
+		t.Errorf("Ping called %d times; want 3 (two failures, then success)", mock.pingCalls)
+	}
+	if len(mock.inspected) != len(config.Engines()) {
+		t.Errorf("inspected %v; want one image per engine %v", mock.inspected, config.Engines())
+	}
+	if os.Getuid() != 0 && len(warnings) != 0 {
+		t.Errorf("unexpected warnings: %v", warnings)
+	}
+}
+
+func TestPreflight_DaemonUnreachable(t *testing.T) {
+	shortPing(t)
+	mock := &mockDockerClient{pingFailures: 1 << 30}
+	err := NewDockerOrchestrator(mock, preflightConfig()).Preflight(context.Background(), func(string) {})
+	if err == nil || !strings.Contains(err.Error(), "cannot reach the Docker daemon") {
+		t.Fatalf("err = %v; want cannot reach the Docker daemon", err)
+	}
+	if mock.pingCalls < 2 {
+		t.Errorf("Ping called %d times; want retries", mock.pingCalls)
+	}
+}
+
+func TestPreflight_NetworkMissing(t *testing.T) {
+	shortPing(t)
+	mock := &mockDockerClient{failNetwork: fmt.Errorf("network tilcayo-net not found: %w", cerrdefs.ErrNotFound)}
+	err := NewDockerOrchestrator(mock, preflightConfig()).Preflight(context.Background(), func(string) {})
+	if err == nil {
+		t.Fatal("expected an error for a missing network, got nil")
+	}
+	for _, want := range []string{"TILCAYO_DOCKER_NETWORK", "does not exist", "docker network create tilcayo-net"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error %q should contain %q", err, want)
+		}
+	}
+	if mock.pingCalls != 1 {
+		t.Errorf("Ping called %d times; a missing network must not be retried", mock.pingCalls)
+	}
+}
+
+func TestPreflight_NetworkInspectError(t *testing.T) {
+	shortPing(t)
+	mock := &mockDockerClient{failNetwork: errors.New("permission denied")}
+	err := NewDockerOrchestrator(mock, preflightConfig()).Preflight(context.Background(), func(string) {})
+	if err == nil || !strings.Contains(err.Error(), "permission denied") || strings.Contains(err.Error(), "does not exist") {
+		t.Fatalf("err = %v; want the inspect error, not 'does not exist'", err)
+	}
+}
+
+func TestPreflight_MissingImageWarns(t *testing.T) {
+	shortPing(t)
+	mock := &mockDockerClient{missingImages: map[string]bool{"worker-general:test": true}}
+	var warnings []string
+	err := NewDockerOrchestrator(mock, preflightConfig()).Preflight(context.Background(), func(s string) { warnings = append(warnings, s) })
+	if err != nil {
+		t.Fatalf("a missing image must only warn, got error: %v", err)
+	}
+	var imageWarnings []string
+	for _, w := range warnings {
+		if strings.Contains(w, "image") {
+			imageWarnings = append(imageWarnings, w)
+		}
+	}
+	if len(imageWarnings) != 1 {
+		t.Fatalf("image warnings = %v; want exactly one", imageWarnings)
+	}
+	for _, want := range []string{"worker-general:test", `"general"`, "docker pull worker-general:test", "TILCAYO_IMAGE_GENERAL"} {
+		if !strings.Contains(imageWarnings[0], want) {
+			t.Errorf("warning %q should contain %q", imageWarnings[0], want)
+		}
 	}
 }

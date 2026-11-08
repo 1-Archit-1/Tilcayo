@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"net/http"
@@ -78,5 +79,11 @@ func newDockerOrchestrator(cfg *config.Config) (orchestrator.Orchestrator, func(
 		_ = cli.Close()
 	}
 
-	return orchestrator.NewDockerOrchestrator(cli, cfg), cleanup, nil
+	orch := orchestrator.NewDockerOrchestrator(cli, cfg)
+	warn := func(msg string) { fmt.Fprintf(os.Stderr, "Warning: %s\n", msg) }
+	if err := orch.Preflight(context.Background(), warn); err != nil {
+		cleanup()
+		return nil, nil, err
+	}
+	return orch, cleanup, nil
 }

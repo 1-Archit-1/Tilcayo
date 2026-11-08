@@ -27,6 +27,7 @@ const (
 	EnvDockerNetwork    = "TILCAYO_DOCKER_NETWORK"
 	EnvJobCPU           = "TILCAYO_JOB_CPU"
 	EnvJobMemory        = "TILCAYO_JOB_MEMORY"
+	EnvMemoryFraction   = "TILCAYO_MEMORY_FRACTION"
 	EnvImagePrefix      = "TILCAYO_IMAGE_" // plus the upper-cased engine name, e.g. TILCAYO_IMAGE_ML
 )
 
@@ -59,8 +60,8 @@ func fromEnvOrDefault(key, fallback string) string {
 
 // FromEnv loads the raw Config struct from environment variables.
 // An empty variable counts as unset, by design (Kubernetes often sets empty values).
-// Values are trimmed, absolute host paths are cleaned, and TILCAYO_JOB_CPU and
-// TILCAYO_JOB_MEMORY are parsed and range-checked here.
+// Values are trimmed, absolute host paths are cleaned, and TILCAYO_JOB_CPU,
+// TILCAYO_JOB_MEMORY and TILCAYO_MEMORY_FRACTION are parsed and range-checked here.
 // TILCAYO_S3_USE_SSL accepts what strconv.ParseBool does: 1 t T TRUE true True
 // 0 f F FALSE false False. Anything else, such as "off", is an error.
 func FromEnv() (Config, error) {
@@ -108,6 +109,15 @@ func FromEnv() (Config, error) {
 		jobMemory = parsed
 	}
 
+	memoryFraction := DefaultMemoryFraction
+	if raw := getenv(EnvMemoryFraction); raw != "" {
+		parsed, err := parseMemoryFraction(raw)
+		if err != nil {
+			return Config{}, err
+		}
+		memoryFraction = parsed
+	}
+
 	images := make(map[string]string)
 	for engine := range engines {
 		if img := getenv(imageEnvName(engine)); img != "" {
@@ -133,6 +143,7 @@ func FromEnv() (Config, error) {
 		DockerNetwork:    getenv(EnvDockerNetwork),
 		JobCPU:           jobCPU,
 		JobMemoryBytes:   jobMemory,
+		MemoryFraction:   memoryFraction,
 		Images:           images,
 	}, nil
 }

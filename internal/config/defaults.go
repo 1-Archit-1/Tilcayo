@@ -53,6 +53,10 @@ const (
 	DefaultResultsMode = ResultsS3
 	DefaultURLStyle    = URLStyleVhost
 	DefaultCPU         = 1.0 // cores, every engine
+
+	// Share of a worker's memory limit DuckDB may use before spilling to
+	// disk. DuckDB's own 80% got capped containers OOM-killed (issue #9).
+	DefaultMemoryFraction = 0.5
 )
 
 // Allowed range for TILCAYO_JOB_CPU (cores) and TILCAYO_JOB_MEMORY (bytes).

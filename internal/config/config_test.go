@@ -27,15 +27,17 @@ func validS3Config() config.Config {
 		S3Secret:      "minioadmin",
 		S3Region:      "garage",
 		S3URLStyle:    "vhost",
+		DockerNetwork: "tilcayo-net",
 	}
 }
 
 func validLocalConfig() config.Config {
 	return config.Config{
-		Orchestrator: "docker",
-		ResultsMode:  "local",
-		ResultsDir:   "/var/results",
-		S3URLStyle:   "vhost",
+		Orchestrator:  "docker",
+		ResultsMode:   "local",
+		ResultsDir:    "/var/results",
+		S3URLStyle:    "vhost",
+		DockerNetwork: "tilcayo-net",
 	}
 }
 
@@ -57,6 +59,11 @@ func TestValidate(t *testing.T) {
 		{name: "unknown results mode", modify: func(c *config.Config) { c.ResultsMode = "azure" }, wantErr: "TILCAYO_RESULTS_MODE"},
 		{name: "local mode refused in kubernetes", base: validLocalConfig,
 			modify: func(c *config.Config) { c.Orchestrator = "kubernetes" }, wantErr: "TILCAYO_RESULTS_MODE"},
+		{name: "docker without network", modify: func(c *config.Config) { c.DockerNetwork = "" }, wantErr: "TILCAYO_DOCKER_NETWORK"},
+		{name: "kubernetes needs no docker network", modify: func(c *config.Config) {
+			c.Orchestrator = "kubernetes"
+			c.DockerNetwork = ""
+		}},
 		{name: "unknown url style", modify: func(c *config.Config) { c.S3URLStyle = "virtual" }, wantErr: "TILCAYO_S3_URL_STYLE"},
 
 		// Local results
@@ -279,7 +286,7 @@ var allEnvVars = []string{
 	"TILCAYO_S3_OUTPUT_PREFIX", "TILCAYO_S3_INPUT_PREFIXES", "TILCAYO_DATA_SOURCE",
 	"TILCAYO_S3_KEY_ID", "TILCAYO_S3_SECRET", "TILCAYO_S3_REGION",
 	"TILCAYO_S3_ENDPOINT", "TILCAYO_S3_PUBLIC_ENDPOINT", "TILCAYO_S3_URL_STYLE", "TILCAYO_S3_USE_SSL",
-	"TILCAYO_DOCKER_NETWORK", "TILCAYO_JOB_CPU", "TILCAYO_JOB_MEMORY",
+	"TILCAYO_DOCKER_NETWORK", "TILCAYO_JOB_CPU", "TILCAYO_JOB_MEMORY", "TILCAYO_MEMORY_FRACTION",
 	"TILCAYO_IMAGE_GENERAL", "TILCAYO_IMAGE_SPATIAL", "TILCAYO_IMAGE_ML",
 }
 
@@ -314,6 +321,7 @@ func TestFromEnvReadsEveryVariable(t *testing.T) {
 		"TILCAYO_DOCKER_NETWORK":     "tilcayo-net",
 		"TILCAYO_JOB_CPU":            "0.5",
 		"TILCAYO_JOB_MEMORY":         "2Gi",
+		"TILCAYO_MEMORY_FRACTION":    "0.25",
 		"TILCAYO_IMAGE_GENERAL":      "img-general:1",
 		"TILCAYO_IMAGE_SPATIAL":      "img-spatial:2",
 		"TILCAYO_IMAGE_ML":           "img-ml:3",
@@ -336,6 +344,7 @@ func TestFromEnvReadsEveryVariable(t *testing.T) {
 		DockerNetwork:    "tilcayo-net",
 		JobCPU:           0.5,
 		JobMemoryBytes:   2 * gi,
+		MemoryFraction:   0.25,
 		Images: map[string]string{
 			config.EngineGeneral: "img-general:1",
 			config.EngineSpatial: "img-spatial:2",
@@ -365,6 +374,7 @@ func TestFromEnvDefaults(t *testing.T) {
 		S3PublicEndpoint: "http://garage:3900", // falls back to the endpoint
 		S3URLStyle:       "vhost",
 		S3UseSSL:         true,
+		MemoryFraction:   0.5,
 		Images:           map[string]string{},
 		// Orchestrator has no default: it stays "" and Validate rejects it.
 	}
@@ -383,6 +393,10 @@ func TestFromEnvRejectsBadValues(t *testing.T) {
 		{"TILCAYO_JOB_MEMORY", "1.5Gi"},
 		{"TILCAYO_JOB_MEMORY", "63Mi"},
 		{"TILCAYO_JOB_MEMORY", "17179869185Gi"}, // 2^34+1 Gi would wrap int64 to an in-range 1Gi
+		{"TILCAYO_MEMORY_FRACTION", "0"},
+		{"TILCAYO_MEMORY_FRACTION", "1.01"},
+		{"TILCAYO_MEMORY_FRACTION", "NaN"},
+		{"TILCAYO_MEMORY_FRACTION", "half"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name+"="+tt.value, func(t *testing.T) {
@@ -397,6 +411,7 @@ func TestFromEnvRejectsBadValues(t *testing.T) {
 func TestLoad(t *testing.T) {
 	validEnv := map[string]string{
 		"TILCAYO_ORCHESTRATOR":     "docker",
+		"TILCAYO_DOCKER_NETWORK":   "tilcayo-net",
 		"TILCAYO_S3_OUTPUT_PREFIX": "s3://mybucket/results/",
 		"TILCAYO_S3_KEY_ID":        "AKIATESTKEY",
 		"TILCAYO_S3_SECRET":        "SECRETVALUE",

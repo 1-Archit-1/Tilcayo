@@ -6,6 +6,7 @@ import (
 	"math"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 )
@@ -82,9 +83,10 @@ type Config struct {
 	S3PublicEndpoint string   // optional caller endpoint, defaults to S3Endpoint
 	S3URLStyle       string   // "vhost" (default) or "path"
 	S3UseSSL         bool     // default true; accepts what strconv.ParseBool does
-	DockerNetwork    string
-	JobCPU           float64 // cores for every engine; 0 means the default (from TILCAYO_JOB_CPU)
-	JobMemoryBytes   int64   // memory for every engine; 0 means the engine's default (from TILCAYO_JOB_MEMORY)
+	DockerNetwork    string   // network workers join; required in docker mode (from TILCAYO_DOCKER_NETWORK)
+	JobCPU           float64  // cores for every engine; 0 means the default (from TILCAYO_JOB_CPU)
+	JobMemoryBytes   int64    // memory for every engine; 0 means the engine's default (from TILCAYO_JOB_MEMORY)
+	MemoryFraction   float64  // in (0, 1], passed to workers (from TILCAYO_MEMORY_FRACTION, default 0.5)
 	// Images maps engine name to an override image (from TILCAYO_IMAGE_<ENGINE>).
 	// Only engines with an override are present. Treat as read-only after
 	// FromEnv: copies of Config share this map.
@@ -130,6 +132,26 @@ func (c Config) ImageFor(engine string) (string, error) {
 		return img, nil
 	}
 	return fmt.Sprintf(defaultImageFormat, engine, Version), nil
+}
+
+// Engines returns the known engine names, sorted.
+func Engines() []string {
+	names := make([]string, 0, len(engines))
+	for name := range engines {
+		names = append(names, name)
+	}
+	slices.Sort(names)
+	return names
+}
+
+// parseMemoryFraction parses a fraction in (0, 1], the range the worker accepts.
+func parseMemoryFraction(s string) (float64, error) {
+	v, err := strconv.ParseFloat(s, 64)
+	// Written as !(in range) so NaN is rejected too, as in parseCPU.
+	if err != nil || !(v > 0 && v <= 1) {
+		return 0, fmt.Errorf("%s must be a number greater than 0 and at most 1, got %q", EnvMemoryFraction, s)
+	}
+	return v, nil
 }
 
 // parseCPU parses a CPU count in cores.
@@ -227,7 +249,8 @@ func (c Config) Validate() error {
 	return nil
 }
 
-// validateModes checks the orchestrator and results mode, and that they fit together.
+// validateModes checks the orchestrator and results mode, that they fit
+// together, and that docker mode names a worker network.
 func (c Config) validateModes() error {
 	if c.Orchestrator != OrchestratorDocker && c.Orchestrator != OrchestratorKubernetes {
 		return fmt.Errorf("%s must be 'docker' or 'kubernetes', got %q", EnvOrchestrator, c.Orchestrator)
@@ -237,6 +260,11 @@ func (c Config) validateModes() error {
 	}
 	if c.ResultsMode == ResultsLocal && c.Orchestrator != OrchestratorDocker {
 		return fmt.Errorf("%s=local is only supported with %s=docker", EnvResultsMode, EnvOrchestrator)
+	}
+	// No fallback to Docker's default bridge: it has no container-name DNS
+	// and lets workers reach every other container on it (issue #9).
+	if c.Orchestrator == OrchestratorDocker && c.DockerNetwork == "" {
+		return fmt.Errorf("%s is required when %s=docker", EnvDockerNetwork, EnvOrchestrator)
 	}
 	return nil
 }
