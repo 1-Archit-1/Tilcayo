@@ -68,7 +68,7 @@ func (r Resources) NanoCPUs() int64 {
 
 // Config holds the startup configuration for the Tilcayo control plane.
 type Config struct {
-	Port             string
+	ListenAddr       string   // host:port or :port to bind (from TILCAYO_LISTEN_ADDR)
 	Orchestrator     string   // "docker" or "kubernetes" (from TILCAYO_ORCHESTRATOR)
 	ResultsMode      string   // "s3" or "local" (from TILCAYO_RESULTS_MODE)
 	ResultsDir       string   // host path for local results (from TILCAYO_RESULTS_DIR)

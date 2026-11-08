@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 
@@ -44,11 +45,10 @@ type ErrorResponse struct {
 }
 
 // JobResponse is returned for GET /jobs/{id}.
+// It describes the job's state rather than echoing the submission query or webhook URL.
 type JobResponse struct {
 	ID         string             `json:"id"`
 	Engine     string             `json:"engine"`
-	Query      string             `json:"query"`
-	WebhookURL string             `json:"webhook_url,omitempty"`
 	State      orchestrator.State `json:"state"`
 	ExitCode   *int               `json:"exit_code,omitempty"`
 	Error      string             `json:"error,omitempty"`
@@ -103,23 +103,13 @@ func (s *Server) handleCreateJob(w http.ResponseWriter, r *http.Request) {
 
 	var req CreateJobRequest
 	if err := dec.Decode(&req); err != nil {
-		var maxBytesErr *http.MaxBytesError
-		if errors.As(err, &maxBytesErr) {
-			writeError(w, http.StatusRequestEntityTooLarge, "request body too large")
-			return
-		}
-		writeError(w, http.StatusBadRequest, "invalid request body")
+		writeDecodeError(w, err)
 		return
 	}
 
 	var extra any
 	if err := dec.Decode(&extra); err != io.EOF {
-		var maxBytesErr *http.MaxBytesError
-		if errors.As(err, &maxBytesErr) {
-			writeError(w, http.StatusRequestEntityTooLarge, "request body too large")
-			return
-		}
-		writeError(w, http.StatusBadRequest, "invalid request body")
+		writeDecodeError(w, err)
 		return
 	}
 
@@ -127,7 +117,7 @@ func (s *Server) handleCreateJob(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "engine is required")
 		return
 	}
-	if _, err := s.cfg.ImageFor(req.Engine); errors.Is(err, config.ErrUnknownEngine) {
+	if _, err := s.cfg.ImageFor(req.Engine); err != nil {
 		writeError(w, http.StatusBadRequest, fmt.Sprintf("unknown engine: %q", req.Engine))
 		return
 	}
@@ -142,6 +132,13 @@ func (s *Server) handleCreateJob(w http.ResponseWriter, r *http.Request) {
 	if strings.Contains(req.SQL, "\x00") {
 		writeError(w, http.StatusBadRequest, "sql query contains null byte")
 		return
+	}
+	if req.WebhookURL != "" {
+		u, err := url.Parse(req.WebhookURL)
+		if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+			writeError(w, http.StatusBadRequest, "invalid webhook_url: must be an absolute http or https URL")
+			return
+		}
 	}
 
 	jobID := newJobID()
@@ -172,17 +169,18 @@ func (s *Server) handleGetJob(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var finishedAt *time.Time
-	var exitCode *int
 	if !job.FinishedAt.IsZero() {
 		finishedAt = &job.FinishedAt
+	}
+
+	var exitCode *int
+	if job.State.IsTerminal() {
 		exitCode = &job.ExitCode
 	}
 
 	resp := JobResponse{
 		ID:         job.ID,
 		Engine:     job.Engine,
-		Query:      job.Query,
-		WebhookURL: job.WebhookURL,
 		State:      job.State,
 		ExitCode:   exitCode,
 		Error:      job.Error,
@@ -190,6 +188,17 @@ func (s *Server) handleGetJob(w http.ResponseWriter, r *http.Request) {
 		FinishedAt: finishedAt,
 	}
 	writeJSON(w, http.StatusOK, resp)
+}
+
+// writeDecodeError inspects decoding errors,
+// returning writes 413 for a body over the cap, 400 for anything else
+func writeDecodeError(w http.ResponseWriter, err error) {
+	var maxBytesErr *http.MaxBytesError
+	if errors.As(err, &maxBytesErr) {
+		writeError(w, http.StatusRequestEntityTooLarge, "request body too large")
+		return
+	}
+	writeError(w, http.StatusBadRequest, "invalid request body")
 }
 
 // writeJSON writes a JSON response with the given status code and sets Content-Type.

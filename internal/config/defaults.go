@@ -49,7 +49,7 @@ var engines = map[string]engineSpec{
 
 // Application defaults.
 const (
-	DefaultPort        = "8080"
+	DefaultListenAddr  = "127.0.0.1:8080"
 	DefaultResultsMode = ResultsS3
 	DefaultURLStyle    = URLStyleVhost
 	DefaultCPU         = 1.0 // cores, every engine

@@ -275,7 +275,7 @@ func TestAllowedInputs(t *testing.T) {
 // allEnvVars uses literal names on purpose: it pins the names from issue #3,
 // which a typo in a config.Env* constant would otherwise hide.
 var allEnvVars = []string{
-	"PORT", "TILCAYO_ORCHESTRATOR", "TILCAYO_RESULTS_MODE", "TILCAYO_RESULTS_DIR",
+	"TILCAYO_LISTEN_ADDR", "TILCAYO_ORCHESTRATOR", "TILCAYO_RESULTS_MODE", "TILCAYO_RESULTS_DIR",
 	"TILCAYO_S3_OUTPUT_PREFIX", "TILCAYO_S3_INPUT_PREFIXES", "TILCAYO_DATA_SOURCE",
 	"TILCAYO_S3_KEY_ID", "TILCAYO_S3_SECRET", "TILCAYO_S3_REGION",
 	"TILCAYO_S3_ENDPOINT", "TILCAYO_S3_PUBLIC_ENDPOINT", "TILCAYO_S3_URL_STYLE", "TILCAYO_S3_USE_SSL",
@@ -297,7 +297,7 @@ func setEnv(t *testing.T, vars map[string]string) {
 
 func TestFromEnvReadsEveryVariable(t *testing.T) {
 	setEnv(t, map[string]string{
-		"PORT":                       "9090",
+		"TILCAYO_LISTEN_ADDR":        "0.0.0.0:9090",
 		"TILCAYO_ORCHESTRATOR":       "docker",
 		"TILCAYO_RESULTS_MODE":       "local",
 		"TILCAYO_RESULTS_DIR":        "/srv/results/", // cleaned, not rejected
@@ -319,7 +319,7 @@ func TestFromEnvReadsEveryVariable(t *testing.T) {
 		"TILCAYO_IMAGE_ML":           "img-ml:3",
 	})
 	want := config.Config{
-		Port:             "9090",
+		ListenAddr:       "0.0.0.0:9090",
 		Orchestrator:     "docker",
 		ResultsMode:      "local",
 		ResultsDir:       "/srv/results",
@@ -359,7 +359,7 @@ func TestFromEnvDefaults(t *testing.T) {
 		t.Fatalf("FromEnv failed: %v", err)
 	}
 	want := config.Config{
-		Port:             "8080",
+		ListenAddr:       "127.0.0.1:8080",
 		ResultsMode:      "s3",
 		S3Endpoint:       "http://garage:3900",
 		S3PublicEndpoint: "http://garage:3900", // falls back to the endpoint

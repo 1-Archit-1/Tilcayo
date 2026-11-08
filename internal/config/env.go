@@ -10,7 +10,7 @@ import (
 
 // Environment variable names
 const (
-	EnvPort             = "PORT"
+	EnvListenAddr       = "TILCAYO_LISTEN_ADDR"
 	EnvOrchestrator     = "TILCAYO_ORCHESTRATOR"
 	EnvResultsMode      = "TILCAYO_RESULTS_MODE"
 	EnvResultsDir       = "TILCAYO_RESULTS_DIR"
@@ -116,7 +116,7 @@ func FromEnv() (Config, error) {
 	}
 
 	return Config{
-		Port:             fromEnvOrDefault(EnvPort, DefaultPort),
+		ListenAddr:       fromEnvOrDefault(EnvListenAddr, DefaultListenAddr),
 		Orchestrator:     getenv(EnvOrchestrator),
 		ResultsMode:      resultsMode,
 		ResultsDir:       cleanHostPath(getenv(EnvResultsDir)),

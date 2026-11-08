@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"net/http"
 	"os"
@@ -22,15 +23,17 @@ func main() {
 	srv := api.NewServer(&cfg, cache)
 
 	httpServer := &http.Server{
-		Addr:              ":" + cfg.Port,
+		Addr:              cfg.ListenAddr,
 		Handler:           srv.Routes(),
 		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       30 * time.Second,
+		IdleTimeout:       60 * time.Second,
 	}
 
-	fmt.Printf("Tilcayo starting on port %s in %s mode (orchestrator: %s)\n",
-		cfg.Port, cfg.ResultsMode, cfg.Orchestrator)
+	fmt.Printf("Tilcayo starting on %s in %s mode (orchestrator: %s)\n",
+		cfg.ListenAddr, cfg.ResultsMode, cfg.Orchestrator)
 
-	if err := httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+	if err := httpServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		fmt.Fprintf(os.Stderr, "Server error: %v\n", err)
 		os.Exit(1)
 	}

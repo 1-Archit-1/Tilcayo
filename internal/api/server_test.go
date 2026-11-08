@@ -21,7 +21,7 @@ import (
 func setupTestServer(t *testing.T) (*api.Server, *jobcache.Cache) {
 	t.Helper()
 	cfg := &config.Config{
-		Port:        "8080",
+		ListenAddr:  "127.0.0.1:8080",
 		ResultsMode: config.ResultsS3,
 		Images:      make(map[string]string),
 	}
@@ -152,7 +152,7 @@ func TestCreateJob_ValidationErrors(t *testing.T) {
 		},
 		{
 			name:       "sql with NUL byte",
-			body:       fmt.Sprintf(`{"engine":"general","sql":"SELECT 'hello\u0000world'"}`),
+			body:       `{"engine":"general","sql":"SELECT 'hello\u0000world'"}`,
 			wantStatus: http.StatusBadRequest,
 			errSubstr:  "null",
 		},
@@ -161,6 +161,30 @@ func TestCreateJob_ValidationErrors(t *testing.T) {
 			body:       fmt.Sprintf(`{"engine":"general","sql":"%s"}`, strings.Repeat("A", 128001)),
 			wantStatus: http.StatusBadRequest,
 			errSubstr:  "128,000",
+		},
+		{
+			name:       "webhook relative url",
+			body:       `{"engine":"general","sql":"SELECT 1","webhook_url":"/path/only"}`,
+			wantStatus: http.StatusBadRequest,
+			errSubstr:  "webhook_url",
+		},
+		{
+			name:       "webhook missing scheme",
+			body:       `{"engine":"general","sql":"SELECT 1","webhook_url":"example.com/hook"}`,
+			wantStatus: http.StatusBadRequest,
+			errSubstr:  "webhook_url",
+		},
+		{
+			name:       "webhook unsupported scheme",
+			body:       `{"engine":"general","sql":"SELECT 1","webhook_url":"ftp://example.com/hook"}`,
+			wantStatus: http.StatusBadRequest,
+			errSubstr:  "webhook_url",
+		},
+		{
+			name:       "webhook missing host",
+			body:       `{"engine":"general","sql":"SELECT 1","webhook_url":"http://"}`,
+			wantStatus: http.StatusBadRequest,
+			errSubstr:  "webhook_url",
 		},
 	}
 
@@ -229,9 +253,6 @@ func TestGetJob_Found(t *testing.T) {
 	if resp.Engine != testJob.Engine {
 		t.Errorf("engine = %q, want %q", resp.Engine, testJob.Engine)
 	}
-	if resp.Query != testJob.Query {
-		t.Errorf("query = %q, want %q", resp.Query, testJob.Query)
-	}
 	if resp.State != orchestrator.StateSucceeded {
 		t.Errorf("state = %q, want %q", resp.State, orchestrator.StateSucceeded)
 	}
@@ -240,6 +261,15 @@ func TestGetJob_Found(t *testing.T) {
 	}
 	if resp.FinishedAt == nil || !resp.FinishedAt.Equal(finished) {
 		t.Errorf("finished_at = %v, want %v", resp.FinishedAt, finished)
+	}
+
+	// Verify query and webhook_url are omitted from GET response
+	bodyStr := rec.Body.String()
+	if strings.Contains(bodyStr, `"query"`) {
+		t.Errorf("response body unexpectedly contains 'query': %s", bodyStr)
+	}
+	if strings.Contains(bodyStr, `"webhook_url"`) {
+		t.Errorf("response body unexpectedly contains 'webhook_url': %s", bodyStr)
 	}
 }
 
@@ -279,6 +309,47 @@ func TestGetJob_PendingExitCodeOmitted(t *testing.T) {
 	// Verify "exit_code" key is omitted from raw JSON
 	if strings.Contains(rec.Body.String(), "exit_code") {
 		t.Errorf("expected 'exit_code' to be omitted from JSON for pending job, got %s", rec.Body.String())
+	}
+}
+
+func TestGetJob_TerminalWithoutFinishedAtIncludesExitCode(t *testing.T) {
+	srv, cache := setupTestServer(t)
+	handler := srv.Routes()
+
+	failedJob := jobcache.Job{
+		ID:         "job-failed-no-finished-at",
+		Engine:     "general",
+		Query:      "SELECT 1",
+		State:      orchestrator.StateFailed,
+		ExitCode:   137,
+		CreatedAt:  time.Now().UTC(),
+		FinishedAt: time.Time{}, // no timestamp recorded
+	}
+	if err := cache.Put(failedJob); err != nil {
+		t.Fatalf("failed to seed cache: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/jobs/job-failed-no-finished-at", nil)
+	rec := httptest.NewRecorder()
+
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body = %s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+
+	var resp api.JobResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("failed to decode JSON response: %v", err)
+	}
+	if resp.ExitCode == nil || *resp.ExitCode != 137 {
+		t.Errorf("exit_code = %v, want 137", resp.ExitCode)
+	}
+	if resp.FinishedAt != nil {
+		t.Errorf("finished_at = %v, want nil", resp.FinishedAt)
+	}
+	if !strings.Contains(rec.Body.String(), `"exit_code":137`) {
+		t.Errorf("expected exit_code in body: %s", rec.Body.String())
 	}
 }
 
