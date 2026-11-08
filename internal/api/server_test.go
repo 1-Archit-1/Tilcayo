@@ -1,7 +1,9 @@
 package api_test
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -18,7 +20,43 @@ import (
 	"github.com/1-Archit-1/Tilcayo/internal/orchestrator"
 )
 
+type mockOrchestrator struct {
+	lastJobID   string
+	lastSpec    orchestrator.JobSpec
+	failRun     error
+	runCalled   bool
+	eventsChan  chan orchestrator.JobEvent
+	failEvents  error
+	failCancel  error
+	cancelJobID string
+}
+
+func (m *mockOrchestrator) Run(ctx context.Context, jobID string, spec orchestrator.JobSpec) error {
+	m.runCalled = true
+	m.lastJobID = jobID
+	m.lastSpec = spec
+	return m.failRun
+}
+
+func (m *mockOrchestrator) Events(ctx context.Context) (<-chan orchestrator.JobEvent, error) {
+	if m.failEvents != nil {
+		return nil, m.failEvents
+	}
+	return m.eventsChan, nil
+}
+
+func (m *mockOrchestrator) Cancel(ctx context.Context, jobID string) error {
+	m.cancelJobID = jobID
+	return m.failCancel
+}
+
 func setupTestServer(t *testing.T) (*api.Server, *jobcache.Cache) {
+	t.Helper()
+	srv, cache, _ := setupTestServerWithOrch(t, &mockOrchestrator{})
+	return srv, cache
+}
+
+func setupTestServerWithOrch(t *testing.T, orch orchestrator.Orchestrator) (*api.Server, *jobcache.Cache, *mockOrchestrator) {
 	t.Helper()
 	cfg := &config.Config{
 		ListenAddr:  "127.0.0.1:8080",
@@ -26,8 +64,9 @@ func setupTestServer(t *testing.T) (*api.Server, *jobcache.Cache) {
 		Images:      make(map[string]string),
 	}
 	cache := jobcache.New()
-	srv := api.NewServer(cfg, cache)
-	return srv, cache
+	mock, _ := orch.(*mockOrchestrator)
+	srv := api.NewServer(cfg, cache, orch)
+	return srv, cache, mock
 }
 
 func TestMiddlewareRequestID(t *testing.T) {
@@ -51,7 +90,8 @@ func TestMiddlewareRequestID(t *testing.T) {
 }
 
 func TestCreateJob_Success(t *testing.T) {
-	srv, cache := setupTestServer(t)
+	mockOrch := &mockOrchestrator{}
+	srv, cache, _ := setupTestServerWithOrch(t, mockOrch)
 	handler := srv.Routes()
 
 	body := `{"engine":"general","sql":"SELECT 42","webhook_url":"https://example.com/hook"}`
@@ -82,6 +122,20 @@ func TestCreateJob_Success(t *testing.T) {
 		t.Errorf("job state = %q, want %q", resp.State, orchestrator.StatePending)
 	}
 
+	// Verify orchestrator.Run was called with correct parameters
+	if !mockOrch.runCalled {
+		t.Errorf("expected orchestrator.Run to be called")
+	}
+	if mockOrch.lastJobID != resp.ID {
+		t.Errorf("orchestrator jobID = %q, want %q", mockOrch.lastJobID, resp.ID)
+	}
+	if mockOrch.lastSpec.Engine != "general" {
+		t.Errorf("orchestrator engine = %q, want general", mockOrch.lastSpec.Engine)
+	}
+	if mockOrch.lastSpec.Query != "SELECT 42" {
+		t.Errorf("orchestrator query = %q, want SELECT 42", mockOrch.lastSpec.Query)
+	}
+
 	// Verify job was stored in the cache
 	cached, ok := cache.Get(resp.ID)
 	if !ok {
@@ -98,6 +152,49 @@ func TestCreateJob_Success(t *testing.T) {
 	}
 	if cached.State != orchestrator.StatePending {
 		t.Errorf("cached state = %q, want pending", cached.State)
+	}
+}
+
+func TestCreateJob_OrchestratorRunFailure(t *testing.T) {
+	mockOrch := &mockOrchestrator{
+		failRun: errors.New("container launch failure"),
+	}
+	srv, cache, _ := setupTestServerWithOrch(t, mockOrch)
+	handler := srv.Routes()
+
+	body := `{"engine":"general","sql":"SELECT 42"}`
+	req := httptest.NewRequest(http.MethodPost, "/jobs", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want %d; body = %s", rec.Code, http.StatusInternalServerError, rec.Body.String())
+	}
+
+	var errResp api.ErrorResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &errResp); err != nil {
+		t.Fatalf("failed to decode error JSON: %v", err)
+	}
+	if !strings.Contains(errResp.Error, "failed to dispatch job") {
+		t.Errorf("error = %q, want 'failed to dispatch job'", errResp.Error)
+	}
+
+	// Verify the job in cache was marked as failed
+	jobs := cache.List()
+	if len(jobs) != 1 {
+		t.Fatalf("expected 1 job in cache, got %d", len(jobs))
+	}
+	failedJob := jobs[0]
+	if failedJob.State != orchestrator.StateFailed {
+		t.Errorf("cached state = %q, want failed", failedJob.State)
+	}
+	if !strings.Contains(failedJob.Error, "container launch failure") {
+		t.Errorf("cached error = %q, want containing 'container launch failure'", failedJob.Error)
+	}
+	if failedJob.FinishedAt.IsZero() {
+		t.Errorf("expected non-zero FinishedAt for failed job")
 	}
 }
 

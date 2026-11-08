@@ -3,6 +3,7 @@
 package api
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/json"
 	"errors"
@@ -60,13 +61,15 @@ type JobResponse struct {
 type Server struct {
 	cfg   *config.Config
 	cache *jobcache.Cache
+	orch  orchestrator.Orchestrator
 }
 
 // NewServer creates a new API Server with the provided dependencies.
-func NewServer(cfg *config.Config, cache *jobcache.Cache) *Server {
+func NewServer(cfg *config.Config, cache *jobcache.Cache, orch orchestrator.Orchestrator) *Server {
 	return &Server{
 		cfg:   cfg,
 		cache: cache,
+		orch:  orch,
 	}
 }
 
@@ -152,6 +155,20 @@ func (s *Server) handleCreateJob(w http.ResponseWriter, r *http.Request) {
 	}
 	if err := s.cache.Put(job); err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to create job")
+		return
+	}
+	// Detach from client cancellation, but bound with a 10s timeout:
+	runCtx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), 10*time.Second)
+	defer cancel()
+
+	if err := s.orch.Run(runCtx, jobID, orchestrator.JobSpec{Engine: req.Engine, Query: req.SQL}); err != nil {
+		s.cache.Update(orchestrator.JobEvent{
+			JobID:      jobID,
+			State:      orchestrator.StateFailed,
+			Error:      fmt.Sprintf("failed to run container: %v", err),
+			FinishedAt: time.Now().UTC(),
+		})
+		writeError(w, http.StatusInternalServerError, "failed to dispatch job")
 		return
 	}
 	writeJSON(w, http.StatusAccepted, CreateJobResponse{ID: jobID, State: job.State})
