@@ -6,20 +6,20 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
-	"github.com/docker/docker/api/types/container"
-	"github.com/docker/docker/api/types/mount"
-	"github.com/docker/docker/api/types/network"
-	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
+	"github.com/moby/moby/api/types/container"
+	"github.com/moby/moby/api/types/mount"
+	"github.com/moby/moby/client"
 
 	"github.com/1-Archit-1/Tilcayo/internal/config"
 )
 
 // DockerClient abstracts the methods of *client.Client used by DockerOrchestrator.
 type DockerClient interface {
-	ContainerCreate(ctx context.Context, config *container.Config, hostConfig *container.HostConfig, networkingConfig *network.NetworkingConfig, platform *ocispec.Platform, containerName string) (container.CreateResponse, error)
-	ContainerStart(ctx context.Context, containerID string, options container.StartOptions) error
-	ContainerRemove(ctx context.Context, containerID string, options container.RemoveOptions) error
+	ContainerCreate(ctx context.Context, options client.ContainerCreateOptions) (client.ContainerCreateResult, error)
+	ContainerStart(ctx context.Context, containerID string, options client.ContainerStartOptions) (client.ContainerStartResult, error)
+	ContainerRemove(ctx context.Context, containerID string, options client.ContainerRemoveOptions) (client.ContainerRemoveResult, error)
 }
 
 // DockerOrchestrator implements Orchestrator by running workers as Docker containers.
@@ -93,8 +93,9 @@ func (d *DockerOrchestrator) Run(ctx context.Context, jobID string, spec JobSpec
 		})
 	}
 
+	var outDir string
 	if d.cfg.ResultsMode == config.ResultsLocal {
-		outDir := filepath.Join(d.cfg.ResultsDir, jobID)
+		outDir = filepath.Join(d.cfg.ResultsDir, jobID)
 		if err := os.MkdirAll(outDir, 0o755); err != nil {
 			return fmt.Errorf("create results dir: %w", err)
 		}
@@ -128,13 +129,28 @@ func (d *DockerOrchestrator) Run(ctx context.Context, jobID string, spec JobSpec
 		Mounts:      mounts,
 	}
 
-	resp, err := d.cli.ContainerCreate(ctx, containerCfg, hostCfg, nil, nil, "tilcayo-"+jobID)
+	resp, err := d.cli.ContainerCreate(ctx, client.ContainerCreateOptions{
+		Config:     containerCfg,
+		HostConfig: hostCfg,
+		Name:       "tilcayo-" + jobID,
+	})
 	if err != nil {
+		if outDir != "" {
+			_ = os.Remove(outDir)
+		}
 		return fmt.Errorf("create container: %w", err)
 	}
 
-	if err := d.cli.ContainerStart(ctx, resp.ID, container.StartOptions{}); err != nil {
-		_ = d.cli.ContainerRemove(context.WithoutCancel(ctx), resp.ID, container.RemoveOptions{Force: true})
+	if _, err := d.cli.ContainerStart(ctx, resp.ID, client.ContainerStartOptions{}); err != nil {
+		cleanCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
+		defer cancel()
+		_, _ = d.cli.ContainerRemove(cleanCtx, resp.ID, client.ContainerRemoveOptions{
+			Force:         true,
+			RemoveVolumes: true,
+		})
+		if outDir != "" {
+			_ = os.Remove(outDir)
+		}
 		return fmt.Errorf("start container: %w", err)
 	}
 	return nil

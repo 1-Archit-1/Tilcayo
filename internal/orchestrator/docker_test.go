@@ -10,10 +10,9 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/docker/docker/api/types/container"
-	"github.com/docker/docker/api/types/mount"
-	"github.com/docker/docker/api/types/network"
-	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
+	"github.com/moby/moby/api/types/container"
+	"github.com/moby/moby/api/types/mount"
+	"github.com/moby/moby/client"
 
 	"github.com/1-Archit-1/Tilcayo/internal/config"
 )
@@ -24,30 +23,32 @@ type mockDockerClient struct {
 	createdHost   *container.HostConfig
 	startID       string
 	removeID      string
-	removeOpts    container.RemoveOptions
+	removeOpts    client.ContainerRemoveOptions
+	removeCtx     context.Context
 	failCreate    error
 	failStart     error
 }
 
-func (m *mockDockerClient) ContainerCreate(ctx context.Context, cfg *container.Config, hostCfg *container.HostConfig, netCfg *network.NetworkingConfig, platform *ocispec.Platform, containerName string) (container.CreateResponse, error) {
+func (m *mockDockerClient) ContainerCreate(ctx context.Context, opts client.ContainerCreateOptions) (client.ContainerCreateResult, error) {
 	if m.failCreate != nil {
-		return container.CreateResponse{}, m.failCreate
+		return client.ContainerCreateResult{}, m.failCreate
 	}
-	m.createdName = containerName
-	m.createdConfig = cfg
-	m.createdHost = hostCfg
-	return container.CreateResponse{ID: "c-1234567890ab"}, nil
+	m.createdName = opts.Name
+	m.createdConfig = opts.Config
+	m.createdHost = opts.HostConfig
+	return client.ContainerCreateResult{ID: "c-1234567890ab"}, nil
 }
 
-func (m *mockDockerClient) ContainerStart(ctx context.Context, containerID string, options container.StartOptions) error {
+func (m *mockDockerClient) ContainerStart(ctx context.Context, containerID string, options client.ContainerStartOptions) (client.ContainerStartResult, error) {
 	m.startID = containerID
-	return m.failStart
+	return client.ContainerStartResult{}, m.failStart
 }
 
-func (m *mockDockerClient) ContainerRemove(ctx context.Context, containerID string, options container.RemoveOptions) error {
+func (m *mockDockerClient) ContainerRemove(ctx context.Context, containerID string, options client.ContainerRemoveOptions) (client.ContainerRemoveResult, error) {
+	m.removeCtx = ctx
 	m.removeID = containerID
 	m.removeOpts = options
-	return nil
+	return client.ContainerRemoveResult{}, nil
 }
 
 func TestDockerOrchestrator_Run_S3Success(t *testing.T) {
@@ -252,9 +253,10 @@ func TestDockerOrchestrator_Run_UnknownEngine(t *testing.T) {
 }
 
 func TestDockerOrchestrator_Run_StartFailureCleanup(t *testing.T) {
+	tempResults := t.TempDir()
 	cfg := &config.Config{
 		ResultsMode: "local",
-		ResultsDir:  t.TempDir(),
+		ResultsDir:  tempResults,
 	}
 
 	startErr := errors.New("daemon connection lost")
@@ -275,6 +277,107 @@ func TestDockerOrchestrator_Run_StartFailureCleanup(t *testing.T) {
 	}
 	if !mock.removeOpts.Force {
 		t.Errorf("ContainerRemove Force = false; want true")
+	}
+	if !mock.removeOpts.RemoveVolumes {
+		t.Errorf("ContainerRemove RemoveVolumes = false; want true")
+	}
+	if mock.removeCtx == nil {
+		t.Fatal("ContainerRemove called with nil context")
+	}
+	if _, ok := mock.removeCtx.Deadline(); !ok {
+		t.Errorf("ContainerRemove context has no deadline")
+	}
+
+	// Verify job directory was removed on start failure
+	jobDir := filepath.Join(tempResults, "job-1")
+	if _, err := os.Stat(jobDir); !os.IsNotExist(err) {
+		t.Errorf("expected job directory %s to be removed, got err: %v", jobDir, err)
+	}
+}
+
+func TestDockerOrchestrator_Run_CreateFailureCleansResultsDir(t *testing.T) {
+	tempResults := t.TempDir()
+	cfg := &config.Config{
+		ResultsMode: "local",
+		ResultsDir:  tempResults,
+	}
+
+	createErr := errors.New("cannot create container")
+	mock := &mockDockerClient{failCreate: createErr}
+	orch := NewDockerOrchestrator(mock, cfg)
+
+	err := orch.Run(context.Background(), "job-create-fail", JobSpec{Engine: "general", Query: "SELECT 1"})
+	if err == nil {
+		t.Fatal("expected error when ContainerCreate fails, got nil")
+	}
+	if !strings.Contains(err.Error(), "cannot create container") {
+		t.Errorf("error = %v; want cannot create container", err)
+	}
+
+	// Verify job directory was removed on create failure
+	jobDir := filepath.Join(tempResults, "job-create-fail")
+	if _, err := os.Stat(jobDir); !os.IsNotExist(err) {
+		t.Errorf("expected job directory %s to be removed, got err: %v", jobDir, err)
+	}
+}
+
+func TestDockerOrchestrator_Run_NonEmptyResultsDirPreservedOnFailure(t *testing.T) {
+	tempResults := t.TempDir()
+	cfg := &config.Config{
+		ResultsMode: "local",
+		ResultsDir:  tempResults,
+	}
+
+	jobID := "job-non-empty"
+	jobDir := filepath.Join(tempResults, jobID)
+	if err := os.MkdirAll(jobDir, 0o755); err != nil {
+		t.Fatalf("failed to create jobDir: %v", err)
+	}
+	dummyFile := filepath.Join(jobDir, "keep-me.txt")
+	if err := os.WriteFile(dummyFile, []byte("important"), 0o644); err != nil {
+		t.Fatalf("failed to write dummy file: %v", err)
+	}
+
+	mock := &mockDockerClient{failStart: errors.New("start failed")}
+	orch := NewDockerOrchestrator(mock, cfg)
+
+	err := orch.Run(context.Background(), jobID, JobSpec{Engine: "general", Query: "SELECT 1"})
+	if err == nil {
+		t.Fatal("expected Run error, got nil")
+	}
+
+	// Verify that the pre-existing directory and file were NOT deleted by os.Remove
+	if _, err := os.Stat(dummyFile); os.IsNotExist(err) {
+		t.Errorf("pre-existing file %s was deleted unexpectedly", dummyFile)
+	}
+}
+
+func TestDockerOrchestrator_Run_LocalStoreFree_NoS3Env(t *testing.T) {
+	tempResults := t.TempDir()
+
+	cfg := &config.Config{
+		ResultsMode:   "local",
+		ResultsDir:    tempResults,
+		InputPrefixes: nil, // store-free: no S3 input prefixes
+		DockerNetwork: "bridge",
+		S3KeyID:       "should-not-pass-key",
+		S3Secret:      "should-not-pass-secret",
+		S3Region:      "us-west-2",
+		S3Endpoint:    "http://minio:9000",
+	}
+
+	mock := &mockDockerClient{}
+	orch := NewDockerOrchestrator(mock, cfg)
+
+	err := orch.Run(context.Background(), "job-storefree", JobSpec{Engine: "general", Query: "SELECT 1"})
+	if err != nil {
+		t.Fatalf("unexpected Run error: %v", err)
+	}
+
+	for _, e := range mock.createdConfig.Env {
+		if strings.HasPrefix(e, "TILCAYO_S3_") {
+			t.Errorf("store-free mode container unexpectedly received S3 env var: %q", e)
+		}
 	}
 }
 

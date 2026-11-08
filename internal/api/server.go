@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"net/url"
 	"strings"
@@ -162,12 +163,9 @@ func (s *Server) handleCreateJob(w http.ResponseWriter, r *http.Request) {
 	defer cancel()
 
 	if err := s.orch.Run(runCtx, jobID, orchestrator.JobSpec{Engine: req.Engine, Query: req.SQL}); err != nil {
-		s.cache.Update(orchestrator.JobEvent{
-			JobID:      jobID,
-			State:      orchestrator.StateFailed,
-			Error:      fmt.Sprintf("failed to run container: %v", err),
-			FinishedAt: time.Now().UTC(),
-		})
+		s.cache.Delete(jobID)
+		reqID := middleware.GetReqID(r.Context())
+		log.Printf("[%s] failed to dispatch job %s: %v", reqID, jobID, err)
 		writeError(w, http.StatusInternalServerError, "failed to dispatch job")
 		return
 	}

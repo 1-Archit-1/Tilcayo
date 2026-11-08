@@ -181,20 +181,10 @@ func TestCreateJob_OrchestratorRunFailure(t *testing.T) {
 		t.Errorf("error = %q, want 'failed to dispatch job'", errResp.Error)
 	}
 
-	// Verify the job in cache was marked as failed
+	// Verify the job was deleted from cache on dispatch failure
 	jobs := cache.List()
-	if len(jobs) != 1 {
-		t.Fatalf("expected 1 job in cache, got %d", len(jobs))
-	}
-	failedJob := jobs[0]
-	if failedJob.State != orchestrator.StateFailed {
-		t.Errorf("cached state = %q, want failed", failedJob.State)
-	}
-	if !strings.Contains(failedJob.Error, "container launch failure") {
-		t.Errorf("cached error = %q, want containing 'container launch failure'", failedJob.Error)
-	}
-	if failedJob.FinishedAt.IsZero() {
-		t.Errorf("expected non-zero FinishedAt for failed job")
+	if len(jobs) != 0 {
+		t.Fatalf("expected 0 jobs in cache, got %d: %+v", len(jobs), jobs)
 	}
 }
 

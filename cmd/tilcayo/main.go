@@ -11,7 +11,7 @@ import (
 	"github.com/1-Archit-1/Tilcayo/internal/config"
 	"github.com/1-Archit-1/Tilcayo/internal/jobcache"
 	"github.com/1-Archit-1/Tilcayo/internal/orchestrator"
-	"github.com/docker/docker/client"
+	"github.com/moby/moby/client"
 )
 
 func main() {
@@ -68,10 +68,8 @@ func main() {
 }
 
 func newDockerOrchestrator(cfg *config.Config) (orchestrator.Orchestrator, func(), error) {
-	cli, err := client.NewClientWithOpts(
-		client.FromEnv,
-		client.WithAPIVersionNegotiation(),
-	)
+	// API version negotiation is the default in moby/moby/client.
+	cli, err := client.New(client.FromEnv)
 	if err != nil {
 		return nil, nil, fmt.Errorf("connect to docker: %w", err)
 	}
