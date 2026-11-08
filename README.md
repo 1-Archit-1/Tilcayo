@@ -55,7 +55,13 @@ curl -X POST "$TILCAYO_URL/jobs" \
       }'
 ```
 
-`webhook_url` is optional. The response contains the job id. `TILCAYO_URL` is wherever you reach the control plane; the default port is not decided yet.
+`webhook_url` is optional; when given, it must be an absolute `http` or `https` URL. The response is `202 Accepted`:
+
+```json
+{"id": "job-3f9c2a1b7d4e6058", "state": "pending"}
+```
+
+`TILCAYO_URL` is wherever you reach the control plane. By default it listens on `127.0.0.1:8080` (`TILCAYO_LISTEN_ADDR`).
 
 **2. Check its status.**
 
@@ -63,7 +69,12 @@ curl -X POST "$TILCAYO_URL/jobs" \
 curl "$TILCAYO_URL/jobs/<job_id>"
 ```
 
-A job is `queued`, `running`, `succeeded`, `failed` or `cancelled`. A failed job reports why: a worker error with the worker's message, out of memory, timed out, or crashed. A cancelled job has its own state, not `failed`. When it succeeds, the response includes a `result_url`.
+```json
+{"id": "job-3f9c2a1b7d4e6058", "engine": "general", "state": "succeeded", "exit_code": 0,
+ "created_at": "2026-11-07T10:00:00Z", "finished_at": "2026-11-07T10:00:04Z", "result_url": "..."}
+```
+
+A job is `pending`, `running`, `succeeded`, `failed` or `cancelled`. `exit_code` appears once the job has finished, and `finished_at` once its end time is known. A failed job reports why in `error`: a worker error with the worker's message, out of memory, timed out, or crashed. A cancelled job has its own state, not `failed`. When it succeeds, the response includes a `result_url`. The response does not repeat the SQL or the webhook URL you submitted.
 
 **3. Download the result.**
 
@@ -79,7 +90,9 @@ Results are always Parquet. `result_url` is a presigned object-storage URL when 
 
 **Results are kept for 1 hour.** After that the job and its result are deleted and `GET /jobs/<job_id>` returns 404. Download what you need within the hour.
 
-Not decided yet: the exact JSON shape of the responses and webhook payload, and the default port.
+Errors are JSON, `{"error": "<message>"}`, with status `400` for an invalid request (unknown engine, SQL over the limit, bad `webhook_url`, unknown fields), `404` for an unknown job or path, `405` for a wrong method, `413` for a request body over 1 MiB, and `500` for a control-plane fault.
+
+Not decided yet: the webhook payload.
 
 ### Writing queries
 
@@ -107,14 +120,15 @@ The control plane reads all settings from its environment and passes what each w
 | Variable | Needed when | Meaning | Status |
 |---|---|---|---|
 | `TILCAYO_ORCHESTRATOR` | always | `docker` or `kubernetes` | decided |
-| `TILCAYO_RESULTS` | optional | `s3` (default) or `local`. `local` means store-free and is refused in Kubernetes mode | provisional |
-| `TILCAYO_RESULTS_DIR` | `TILCAYO_RESULTS=local` | Host folder for results. Each job gets its own subfolder, deleted after 1h | provisional |
+| `TILCAYO_LISTEN_ADDR` | optional | Address the API listens on, default `127.0.0.1:8080`. Set `:8080` when the control plane runs in a container or pod, and keep the published port internal (see below) | decided |
+| `TILCAYO_RESULTS_MODE` | optional | `s3` (default) or `local`. `local` means store-free and is refused in Kubernetes mode | provisional |
+| `TILCAYO_RESULTS_DIR` | `TILCAYO_RESULTS_MODE=local` | Host folder for results. Each job gets its own subfolder, deleted after 1h | provisional |
 | `TILCAYO_DATA_SOURCE` | optional | The data folder mounted read-only at `/data`. Docker: an absolute host path. Kubernetes: the name of a PVC. Unset means no `/data` | provisional |
-| `TILCAYO_S3_KEY_ID`, `TILCAYO_S3_SECRET` | `TILCAYO_RESULTS=s3`, or to read object storage | Static access keys | decided |
+| `TILCAYO_S3_KEY_ID`, `TILCAYO_S3_SECRET` | `TILCAYO_RESULTS_MODE=s3`, or to read object storage | Static access keys | decided |
 | `TILCAYO_S3_REGION` | with the keys | Required, no default. The control plane refuses to start without it | decided |
 | `TILCAYO_S3_ENDPOINT`, `TILCAYO_S3_PUBLIC_ENDPOINT`, `TILCAYO_S3_URL_STYLE`, `TILCAYO_S3_USE_SSL` | depends on the provider | See [Storage](#storage) | decided |
-| `TILCAYO_OUTPUT_PREFIX` | `TILCAYO_RESULTS=s3` | Where results are written: `s3://bucket/` or `s3://bucket/path/`, ending in `/`. Each job writes `<prefix><job_id>/result.parquet`. Refused in store-free mode | decided |
-| `TILCAYO_INPUT_PREFIXES` | to read object storage | Comma-separated `s3://` prefixes queries may read, for every job, each ending in `/`. May not overlap the output prefix | decided |
+| `TILCAYO_S3_OUTPUT_PREFIX` | `TILCAYO_RESULTS_MODE=s3` | Where results are written: `s3://bucket/` or `s3://bucket/path/`, ending in `/`. Each job writes `<prefix><job_id>/result.parquet`. Refused in store-free mode | decided |
+| `TILCAYO_S3_INPUT_PREFIXES` | to read object storage | Comma-separated `s3://` prefixes queries may read, for every job, each ending in `/`. May not overlap the output prefix | decided |
 | `TILCAYO_IMAGE_<ENGINE>` | optional | Overrides the worker image for one engine, for example `TILCAYO_IMAGE_ML` | decided |
 | `TILCAYO_JOB_CPU`, `TILCAYO_JOB_MEMORY` | optional | CPU and memory limit of each worker. Defaults are per engine: 1 CPU each; 1 GiB for `general` and `spatial`, 4 GiB for `ml` (provisional until measured). When set, they override every engine, so setting memory also resizes `ml` | provisional |
 | `TILCAYO_MEMORY_FRACTION` | optional | Share of a worker's memory limit DuckDB may use before spilling to disk, default `0.5`. See [How workers run](#how-workers-run) | provisional |
@@ -135,12 +149,12 @@ cp orders.csv /srv/tilcayo/data/
 ```bash
 # tilcayo.env
 TILCAYO_ORCHESTRATOR=docker
-TILCAYO_RESULTS=local
+TILCAYO_RESULTS_MODE=local
 TILCAYO_RESULTS_DIR=/srv/tilcayo/results
 TILCAYO_DATA_SOURCE=/srv/tilcayo/data
 ```
 
-**With object storage.** Leave out `TILCAYO_RESULTS` and `TILCAYO_RESULTS_DIR`, keep `TILCAYO_DATA_SOURCE` if you also want local inputs, and add the store settings. The two keys go in their own file, which compose loads with `env_file` and Kubernetes turns into a Secret:
+**With object storage.** Leave out `TILCAYO_RESULTS_MODE` and `TILCAYO_RESULTS_DIR`, keep `TILCAYO_DATA_SOURCE` if you also want local inputs, and add the store settings. The two keys go in their own file, which compose loads with `env_file` and Kubernetes turns into a Secret:
 
 ```bash
 # s3.env  (secret: keep it out of version control)
@@ -157,8 +171,8 @@ TILCAYO_S3_ENDPOINT=garage:3900
 TILCAYO_S3_PUBLIC_ENDPOINT=localhost:3900
 TILCAYO_S3_URL_STYLE=path
 TILCAYO_S3_USE_SSL=false
-TILCAYO_OUTPUT_PREFIX=s3://tilcayo-results/
-TILCAYO_INPUT_PREFIXES=s3://tilcayo-inputs/
+TILCAYO_S3_OUTPUT_PREFIX=s3://tilcayo-results/
+TILCAYO_S3_INPUT_PREFIXES=s3://tilcayo-inputs/
 ```
 
 Things to know:
@@ -166,7 +180,7 @@ Things to know:
 - **Both folder settings are host paths**, even when the control plane runs in a container: the Docker daemon resolves them on the host. If the control plane runs in a container, mount the results folder into it **at the same path** (`/srv/tilcayo/results:/srv/tilcayo/results`), so it can serve and clean up results. It does not need the data folder.
 - **Workers run as the same user as the control plane**, so result files are owned by that user, not root. Files in the data folder must be readable by that user, or queries on them fail.
 - **A wrong data folder path fails the first job that uses it**, not the startup, because the control plane cannot check host paths from inside its container.
-- **Do not expose the control plane publicly.** v1 has no authentication, it runs any submitted SQL, and in Docker mode it holds the Docker socket, which is root-equivalent on the host. Keep its port on an internal network or bound to `127.0.0.1`. Anyone who can reach it and knows a job id can download that job's result. A request can only choose the engine, the SQL and a webhook URL, never the image, mounts or environment of a worker, and workers never get the socket.
+- **Do not expose the control plane publicly.** v1 has no authentication, it runs any submitted SQL, and in Docker mode it holds the Docker socket, which is root-equivalent on the host. It listens on `127.0.0.1:8080` by default, which also keeps worker containers from reaching it. If it runs in a container, it must listen on `:8080` inside the container; publish that port only on `127.0.0.1` (`127.0.0.1:8080:8080`) or an internal network. Anyone who can reach it and knows a job id can download that job's result. A request can only choose the engine, the SQL and a webhook URL, never the image, mounts or environment of a worker, and workers never get the socket.
 
 Spawned workers join the network named by `TILCAYO_DOCKER_NETWORK`. Not decided yet: the compose file itself, including the control plane image name.
 
