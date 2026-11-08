@@ -55,7 +55,13 @@ curl -X POST "$TILCAYO_URL/jobs" \
       }'
 ```
 
-`webhook_url` is optional. The response contains the job id. `TILCAYO_URL` is wherever you reach the control plane; the default port is not decided yet.
+`webhook_url` is optional; when given, it must be an absolute `http` or `https` URL. The response is `202 Accepted`:
+
+```json
+{"id": "job-3f9c2a1b7d4e6058", "state": "pending"}
+```
+
+`TILCAYO_URL` is wherever you reach the control plane. By default it listens on `127.0.0.1:8080` (`TILCAYO_LISTEN_ADDR`).
 
 **2. Check its status.**
 
@@ -63,7 +69,12 @@ curl -X POST "$TILCAYO_URL/jobs" \
 curl "$TILCAYO_URL/jobs/<job_id>"
 ```
 
-A job is `queued`, `running`, `succeeded`, `failed` or `cancelled`. A failed job reports why: a worker error with the worker's message, out of memory, timed out, or crashed. A cancelled job has its own state, not `failed`. When it succeeds, the response includes a `result_url`.
+```json
+{"id": "job-3f9c2a1b7d4e6058", "engine": "general", "state": "succeeded", "exit_code": 0,
+ "created_at": "2026-11-07T10:00:00Z", "finished_at": "2026-11-07T10:00:04Z", "result_url": "..."}
+```
+
+A job is `pending`, `running`, `succeeded`, `failed` or `cancelled`. `exit_code` appears once the job has finished, and `finished_at` once its end time is known. A failed job reports why in `error`: a worker error with the worker's message, out of memory, timed out, or crashed. A cancelled job has its own state, not `failed`. When it succeeds, the response includes a `result_url`. The response does not repeat the SQL or the webhook URL you submitted.
 
 **3. Download the result.**
 
@@ -79,7 +90,9 @@ Results are always Parquet. `result_url` is a presigned object-storage URL when 
 
 **Results are kept for 1 hour.** After that the job and its result are deleted and `GET /jobs/<job_id>` returns 404. Download what you need within the hour.
 
-Not decided yet: the exact JSON shape of the responses and webhook payload, and the default port.
+Errors are JSON, `{"error": "<message>"}`, with status `400` for an invalid request (unknown engine, SQL over the limit, bad `webhook_url`, unknown fields), `404` for an unknown job or path, `405` for a wrong method, `413` for a request body over 1 MiB, and `500` for a control-plane fault.
+
+Not decided yet: the webhook payload.
 
 ### Writing queries
 
@@ -107,6 +120,7 @@ The control plane reads all settings from its environment and passes what each w
 | Variable | Needed when | Meaning | Status |
 |---|---|---|---|
 | `TILCAYO_ORCHESTRATOR` | always | `docker` or `kubernetes` | decided |
+| `TILCAYO_LISTEN_ADDR` | optional | Address the API listens on, default `127.0.0.1:8080`. Set `:8080` when the control plane runs in a container or pod, and keep the published port internal (see below) | decided |
 | `TILCAYO_RESULTS_MODE` | optional | `s3` (default) or `local`. `local` means store-free and is refused in Kubernetes mode | provisional |
 | `TILCAYO_RESULTS_DIR` | `TILCAYO_RESULTS_MODE=local` | Host folder for results. Each job gets its own subfolder, deleted after 1h | provisional |
 | `TILCAYO_DATA_SOURCE` | optional | The data folder mounted read-only at `/data`. Docker: an absolute host path. Kubernetes: the name of a PVC. Unset means no `/data` | provisional |
@@ -115,26 +129,28 @@ The control plane reads all settings from its environment and passes what each w
 | `TILCAYO_S3_ENDPOINT`, `TILCAYO_S3_PUBLIC_ENDPOINT`, `TILCAYO_S3_URL_STYLE`, `TILCAYO_S3_USE_SSL` | depends on the provider | See [Storage](#storage) | decided |
 | `TILCAYO_S3_OUTPUT_PREFIX` | `TILCAYO_RESULTS_MODE=s3` | Where results are written: `s3://bucket/` or `s3://bucket/path/`, ending in `/`. Each job writes `<prefix><job_id>/result.parquet`. Refused in store-free mode | decided |
 | `TILCAYO_S3_INPUT_PREFIXES` | to read object storage | Comma-separated `s3://` prefixes queries may read, for every job, each ending in `/`. May not overlap the output prefix | decided |
-| `TILCAYO_IMAGE_<ENGINE>` | optional | Overrides the worker image for one engine, for example `TILCAYO_IMAGE_ML` | decided |
+| `TILCAYO_IMAGE_<ENGINE>` | optional | Overrides the worker image for one engine, for example `TILCAYO_IMAGE_ML`. In Docker mode images are not pulled for you yet: see [Docker mode setup](#docker-mode-setup) | decided |
 | `TILCAYO_JOB_CPU`, `TILCAYO_JOB_MEMORY` | optional | CPU and memory limit of each worker. Defaults are per engine: 1 CPU each; 1 GiB for `general` and `spatial`, 4 GiB for `ml` (provisional until measured). When set, they override every engine, so setting memory also resizes `ml` | provisional |
-| `TILCAYO_MEMORY_FRACTION` | optional | Share of a worker's memory limit DuckDB may use before spilling to disk, default `0.5`. See [How workers run](#how-workers-run) | provisional |
+| `TILCAYO_MEMORY_FRACTION` | optional | Share of a worker's memory limit DuckDB may use before spilling to disk: a number above 0 and at most 1, default `0.5`. See [How workers run](#how-workers-run) | provisional |
 | `TILCAYO_MAX_CONCURRENT_JOBS` | optional, Docker mode | Jobs over the limit wait in a queue | provisional |
-| `TILCAYO_DOCKER_NETWORK` | Docker mode | Network workers join to reach the store. The control plane is not on it | provisional |
+| `TILCAYO_DOCKER_NETWORK` | Docker mode, required | Name of an existing user-defined Docker network that workers join, for example to reach the store. The control plane is not on it. Docker's built-in `bridge`, `host` and `none` are refused | decided |
 
 The control plane refuses to start, naming the missing setting, when a required one is unset or does not fit the mode (for example a PVC name given as a path).
 
 ### Docker mode setup
 
-**Store-free.** Create two folders on the host: one with your data, one for results.
+**Store-free.** Create two folders on the host, one with your data and one for results, and a Docker network for the workers:
 
 ```bash
 mkdir -p /srv/tilcayo/data /srv/tilcayo/results
 cp orders.csv /srv/tilcayo/data/
+docker network create tilcayo
 ```
 
 ```bash
 # tilcayo.env
 TILCAYO_ORCHESTRATOR=docker
+TILCAYO_DOCKER_NETWORK=tilcayo
 TILCAYO_RESULTS_MODE=local
 TILCAYO_RESULTS_DIR=/srv/tilcayo/results
 TILCAYO_DATA_SOURCE=/srv/tilcayo/data
@@ -149,8 +165,9 @@ TILCAYO_S3_SECRET=...
 ```
 
 ```bash
-# tilcayo.env  (example for a Garage store on the same compose network)
+# tilcayo.env  (example for a Garage store attached to the workers' network)
 TILCAYO_ORCHESTRATOR=docker
+TILCAYO_DOCKER_NETWORK=tilcayo
 TILCAYO_DATA_SOURCE=/srv/tilcayo/data
 TILCAYO_S3_REGION=garage
 TILCAYO_S3_ENDPOINT=garage:3900
@@ -164,11 +181,13 @@ TILCAYO_S3_INPUT_PREFIXES=s3://tilcayo-inputs/
 Things to know:
 
 - **Both folder settings are host paths**, even when the control plane runs in a container: the Docker daemon resolves them on the host. If the control plane runs in a container, mount the results folder into it **at the same path** (`/srv/tilcayo/results:/srv/tilcayo/results`), so it can serve and clean up results. It does not need the data folder.
-- **Workers run as the same user as the control plane**, so result files are owned by that user, not root. Files in the data folder must be readable by that user, or queries on them fail.
+- **Workers run as the same user as the control plane**, so result files are owned by that user. Files in the data folder must be readable by that user, or queries on them fail. **Exception: if the control plane runs as root** (for example started with `sudo`, or in a container without a `user:` setting), workers run as uid:gid `65532:65532`, the worker images' default, because workers never run as root. The control plane logs a warning at startup, and hands each job's own results subfolder to uid 65532 so the worker can write its result. Result files are then owned by 65532, and data files must be readable by uid 65532 (for example world-readable).
+- **Startup checks.** Before it accepts jobs, the control plane waits up to 15s for the Docker daemon to answer (check `DOCKER_HOST` if it gives up), then refuses to start if the `TILCAYO_DOCKER_NETWORK` network does not exist. It must be a user-defined network: Docker's built-in `bridge`, `host` and `none` are refused, because they would put workers on a network shared with other containers, or on the host's own `localhost`. Tilcayo never creates the network: create it with `docker network create`, or declare it in your compose file. Compose prefixes network names with the project name (`myproject_tilcayo`) unless the network sets `name:`, so either give it `name: tilcayo` or set `TILCAYO_DOCKER_NETWORK` to the full name. Compose creates its declared networks before any service starts; a network marked `external: true` must already exist.
+- **Pull worker images yourself.** The control plane does not pull images yet. At startup it logs a warning for each engine whose image is not on the host, and submitting a job for that engine returns `500` (`failed to dispatch job`, with "No such image" in the control-plane log) until you `docker pull` it (or point `TILCAYO_IMAGE_<ENGINE>` at an image you have). Engines whose images are present work normally. Automatic pulling is planned.
 - **A wrong data folder path fails the first job that uses it**, not the startup, because the control plane cannot check host paths from inside its container.
-- **Do not expose the control plane publicly.** v1 has no authentication, it runs any submitted SQL, and in Docker mode it holds the Docker socket, which is root-equivalent on the host. Keep its port on an internal network or bound to `127.0.0.1`. Anyone who can reach it and knows a job id can download that job's result. A request can only choose the engine, the SQL and a webhook URL, never the image, mounts or environment of a worker, and workers never get the socket.
+- **Do not expose the control plane publicly.** v1 has no authentication, it runs any submitted SQL, and in Docker mode it holds the Docker socket, which is root-equivalent on the host. It listens on `127.0.0.1:8080` by default, which also keeps worker containers from reaching it. If it runs in a container, it must listen on `:8080` inside the container; publish that port only on `127.0.0.1` (`127.0.0.1:8080:8080`) or an internal network. Anyone who can reach it and knows a job id can download that job's result. A request can only choose the engine, the SQL and a webhook URL, never the image, mounts or environment of a worker, and workers never get the socket.
 
-Spawned workers join the network named by `TILCAYO_DOCKER_NETWORK`. Not decided yet: the compose file itself, including the control plane image name.
+Spawned workers join the network named by `TILCAYO_DOCKER_NETWORK`; attach your store to the same network so workers can reach it by container name. Keep the control plane off that network. Not decided yet: the compose file itself, including the control plane image name.
 
 ### K3s / Kubernetes setup
 
@@ -284,7 +303,7 @@ Credentials are set up using DuckDB's secrets manager (`CREATE SECRET`) rather t
 
 ### How workers run
 
-- **Non-root, locked down.** Workers run as the control plane's user (the images default to uid 65532), with a read-only root filesystem, all Linux capabilities dropped and no privilege escalation. In Kubernetes they meet the Pod Security "restricted" profile and get no service-account token.
+- **Non-root, locked down.** Workers run as the control plane's user, or as uid 65532 (the images' default) when the control plane runs as root, with a read-only root filesystem, all Linux capabilities dropped and no privilege escalation. In Kubernetes they meet the Pod Security "restricted" profile and get no service-account token.
 - **Spilling to disk.** DuckDB writes intermediate data to `/tmp/duckdb` once a query outgrows its memory limit. `/tmp` is a disk-backed volume (a Kubernetes `emptyDir`, a Docker volume), not tmpfs, because tmpfs counts against the worker's memory.
 - **Memory limit.** DuckDB uses `TILCAYO_MEMORY_FRACTION` (default `0.5`) of the worker's memory limit. Its real memory use runs well above that number, about 1.6x in tests on large sorts, and a worker that crosses its container limit is killed without an error message. The limit is read from cgroup v2; on older cgroup v1 hosts the worker logs a warning and DuckDB uses its own default. In Docker mode swap is disabled for workers (the swap limit equals the memory limit), matching Kubernetes.
 - **Cancel and stop.** `tini` runs as PID 1 so a stop signal ends the worker at once.

@@ -21,7 +21,7 @@ The failure kind comes from orchestrator signals only. The worker's output only 
 | Signal | Docker | K8s | Job state / reason |
 |---|---|---|---|
 | success | exit 0 | Job `Complete` | `succeeded` |
-| OOM | 137 + `OOMKilled=true` | container reason `OOMKilled` | `failed`, "out of memory" |
+| OOM | any nonzero exit + `OOMKilled=true` (amended 2026-11-08) | container reason `OOMKilled` | `failed`, "out of memory" |
 | timeout | 137 + `OOMKilled=false` | `DeadlineExceeded`, no annotation | `failed`, "timed out" |
 | cancel | 143 | `DeadlineExceeded` + `tilcayo.io/cancelled=true` | `cancelled` |
 | worker error | exit 1 | `Failed`, exit 1 | `failed`, message from sentinel |
@@ -30,6 +30,11 @@ The failure kind comes from orchestrator signals only. The worker's output only 
 On any worker failure, the final stderr line is `tilcayo-error: <message>`, with newlines escaped as `\n` and truncated to about 1 KiB. The multi-line detail is printed above it. Every exit path goes through `fail()`, and a `sys.excepthook` turns uncaught exceptions into `fail()`.
 
 The control plane parses only the last line of the tail. Exit 1 without the sentinel means `failed`, "worker failed without a message", with the raw tail attached. Any other nonzero exit is a crash.
+
+### Amendments (2026-11-08, walking skeleton item 8)
+
+- **`OOMKilled` wins on any nonzero exit.** Docker can report `OOMKilled=true` with exit 1, when the kernel kills one process and the worker then fails on the knock-on effect; the worker's message is then misleading. The orchestrator signal decides the kind, as above, and Kubernetes reports `OOMKilled` independent of the exit code. Exit 0 stays `succeeded` even with the flag set, because the result was written.
+- **"Raw tail attached" means the control-plane log.** For "worker failed without a message" and "worker crashed (exit N)", the orchestrator logs the capped tail with the job id. `JobEvent` and the API carry only the message: these cases are worker bugs for the operator, and a stack trace is noise for the caller. A `detail` field can be added later without breaking anything.
 
 ## Alternatives considered
 

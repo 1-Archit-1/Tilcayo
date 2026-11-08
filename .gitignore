@@ -5,3 +5,6 @@ duckdb.zip
 *PLAN.md
 tilvenv/
 __pycache__/
+.agents/
+*.code-workspace
+wise_orchestrator_handoff.md
