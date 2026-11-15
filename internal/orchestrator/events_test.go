@@ -9,6 +9,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/moby/moby/api/pkg/stdcopy"
 	"github.com/moby/moby/api/types/container"
@@ -65,6 +66,39 @@ func TestDeframeAndCapLogs(t *testing.T) {
 		// Preserves the tail of the log
 		if !strings.Contains(got, "log line 199") {
 			t.Errorf("got log tail did not include latest line 199: %q", got)
+		}
+	})
+}
+
+func TestCapLogTail(t *testing.T) {
+	t.Run("trailing newline does not cost a line", func(t *testing.T) {
+		var b strings.Builder
+		for i := range 100 {
+			fmt.Fprintf(&b, "l%d\n", i)
+		}
+		got := capLogTail(b.String(), 2048, 80)
+		lines := strings.Split(got, "\n")
+		if len(lines) != 80 {
+			t.Fatalf("kept %d lines, want 80: %q", len(lines), got)
+		}
+		if lines[0] != "l20" || lines[79] != "l99" {
+			t.Errorf("kept lines %q..%q, want l20..l99", lines[0], lines[79])
+		}
+	})
+
+	t.Run("byte cut keeps valid UTF-8", func(t *testing.T) {
+		// "é" is 2 bytes; with a 1-byte suffix, the last 2048 bytes start
+		// in the middle of one.
+		s := strings.Repeat("é", 1500) + "x"
+		got := capLogTail(s, 2048, 80)
+		if !utf8.ValidString(got) {
+			t.Errorf("tail is not valid UTF-8: %q", got[:8])
+		}
+		if len(got) > 2048 {
+			t.Errorf("len = %d bytes, want <= 2048", len(got))
+		}
+		if len(got) != 2047 {
+			t.Errorf("len = %d bytes, want 2047 (one partial rune dropped)", len(got))
 		}
 	})
 }

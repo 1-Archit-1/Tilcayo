@@ -10,6 +10,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	cerrdefs "github.com/containerd/errdefs"
 	"github.com/moby/moby/api/pkg/stdcopy"
@@ -312,14 +313,19 @@ func deframeAndCapLogs(r io.Reader) (string, error) {
 }
 
 // capLogTail caps a log string to maxLines lines and maxBytes bytes.
+// The final newline is dropped first so it does not count as an empty line,
+// and a byte cut never leaves a partial UTF-8 character at the start.
 func capLogTail(s string, maxBytes, maxLines int) string {
-	lines := strings.Split(s, "\n")
+	lines := strings.Split(strings.TrimSuffix(s, "\n"), "\n")
 	if len(lines) > maxLines {
 		lines = lines[len(lines)-maxLines:]
 	}
 	tail := strings.Join(lines, "\n")
 	if len(tail) > maxBytes {
 		tail = tail[len(tail)-maxBytes:]
+		for len(tail) > 0 && !utf8.RuneStart(tail[0]) {
+			tail = tail[1:]
+		}
 	}
 	return tail
 }
