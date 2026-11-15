@@ -533,51 +533,6 @@ func TestEvents_ReconnectBackoffResetsWhenConnected(t *testing.T) {
 	waitClosed(t, cancel, ch)
 }
 
-func TestEvents_RawTailLoggedOnceAcrossReconnects(t *testing.T) {
-	shortBackoff(t, time.Millisecond, time.Millisecond)
-	ctx, cancel := context.WithCancel(context.Background())
-	mock := &mockDockerClient{
-		listItems: []container.Summary{exitedSummary("cid-crash", "job-crash")},
-		inspectResp: map[string]client.ContainerInspectResult{
-			"cid-crash": {Container: container.InspectResponse{State: &container.State{Status: "exited", ExitCode: 3}}},
-		},
-		eventsErr: errors.New("stream dropped"), // every cycle reconnects and re-snapshots
-	}
-	orch := NewDockerOrchestrator(mock, &config.Config{})
-	orch.logErr = func(string) {}
-	var rawLogs int
-	orch.logRaw = func(string, string, string) { rawLogs++ }
-
-	ch, _ := orch.Events(ctx)
-	for i := range 3 {
-		if ev := <-ch; ev.JobID != "job-crash" || ev.Error != "worker crashed (exit 3)" {
-			t.Fatalf("snapshot %d: ev = %+v, want job-crash, worker crashed (exit 3)", i, ev)
-		}
-	}
-	waitClosed(t, cancel, ch)
-	if rawLogs != 1 {
-		t.Errorf("raw tail logged %d times over 3 snapshots, want 1", rawLogs)
-	}
-}
-
-func TestHandleDockerEvent_DestroyForgetsRawLog(t *testing.T) {
-	orch := NewDockerOrchestrator(&mockDockerClient{}, &config.Config{})
-	if !orch.firstRawLog("job-gone") {
-		t.Fatal("firstRawLog = false on first call")
-	}
-	out := make(chan JobEvent, 1)
-	orch.handleDockerEvent(context.Background(), out, events.Message{
-		Action: "destroy",
-		Actor:  events.Actor{ID: "cid-gone", Attributes: exitedSummary("", "job-gone").Labels},
-	})
-	if ev := <-out; !ev.Deleted {
-		t.Fatalf("ev = %+v, want Deleted", ev)
-	}
-	if !orch.firstRawLog("job-gone") {
-		t.Error("firstRawLog = false after destroy, want the ID forgotten")
-	}
-}
-
 func TestLogf_SkipsShutdownCancellation(t *testing.T) {
 	var logs errLog
 	orch := NewDockerOrchestrator(&mockDockerClient{}, &config.Config{})

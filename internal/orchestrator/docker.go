@@ -10,7 +10,6 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 	"unicode/utf8"
 
@@ -70,11 +69,6 @@ type DockerOrchestrator struct {
 	chown        func(name string, uid, gid int) error // os.Chown; replaced in tests
 	logRaw       func(jobID, errMsg, tail string)      // test seam: logs raw tail on crash / failed without message
 	logErr       func(msg string)                      // test seam: logs event-watcher errors
-
-	// Jobs whose raw tail was already logged, so a reconnect snapshot does
-	// not log it again. The mutex covers Events being called more than once.
-	rawMu     sync.Mutex
-	rawLogged map[string]bool
 }
 
 // NewDockerOrchestrator creates a new DockerOrchestrator for a control plane
@@ -94,7 +88,6 @@ func newDockerOrchestrator(cli DockerClient, cfg *config.Config, cpUID, cpGID in
 		gid:          gid,
 		rootFallback: cpUID == 0,
 		chown:        os.Chown,
-		rawLogged:    make(map[string]bool),
 	}
 }
 
@@ -346,18 +339,6 @@ func capLogTail(s string, maxBytes, maxLines int) string {
 	return tail
 }
 
-// firstRawLog records that jobID's raw tail is being logged, and reports
-// whether this is the first time.
-func (d *DockerOrchestrator) firstRawLog(jobID string) bool {
-	d.rawMu.Lock()
-	defer d.rawMu.Unlock()
-	if d.rawLogged[jobID] {
-		return false
-	}
-	d.rawLogged[jobID] = true
-	return true
-}
-
 func (d *DockerOrchestrator) logRawTail(jobID, errMsg, tail string) {
 	if d.logRaw != nil {
 		d.logRaw(jobID, errMsg, tail)
@@ -491,7 +472,7 @@ func (d *DockerOrchestrator) buildExitEvent(
 
 	tail := d.fetchLogTail(ctx, containerID, jobID)
 	state, errMsg, logRaw := Classify(st.ExitCode, st.OOMKilled, tail)
-	if logRaw && d.firstRawLog(jobID) {
+	if logRaw {
 		d.logRawTail(jobID, errMsg, tail)
 	}
 
@@ -638,9 +619,6 @@ func (d *DockerOrchestrator) handleDockerEvent(ctx context.Context, out chan<- J
 		return emitEvent(ctx, out, ev)
 
 	case "destroy":
-		d.rawMu.Lock()
-		delete(d.rawLogged, jobID)
-		d.rawMu.Unlock()
 		return emitEvent(ctx, out, JobEvent{
 			JobID:   jobID,
 			Deleted: true,
