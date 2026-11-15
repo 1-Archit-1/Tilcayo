@@ -32,6 +32,7 @@ func TestClassify(t *testing.T) {
 		logTail    string
 		wantState  State
 		wantErrMsg string
+		wantLogRaw bool
 	}{
 		{
 			name:       "clean exit 0",
@@ -87,6 +88,7 @@ func TestClassify(t *testing.T) {
 			logTail:    "Traceback (most recent call last):\nException: boom\n",
 			wantState:  StateFailed,
 			wantErrMsg: "worker failed without a message",
+			wantLogRaw: true,
 		},
 		{
 			name:       "sentinel followed by a later warning is ignored",
@@ -94,6 +96,7 @@ func TestClassify(t *testing.T) {
 			logTail:    "tilcayo-error: boom\nWARNING: cgroup v1\n",
 			wantState:  StateFailed,
 			wantErrMsg: "worker failed without a message",
+			wantLogRaw: true,
 		},
 		{
 			name:       "last of two sentinel lines wins",
@@ -108,6 +111,7 @@ func TestClassify(t *testing.T) {
 			logTail:    "",
 			wantState:  StateFailed,
 			wantErrMsg: "worker failed without a message",
+			wantLogRaw: true,
 		},
 		{
 			name:       "CRLF endings and trailing blank lines",
@@ -128,17 +132,21 @@ func TestClassify(t *testing.T) {
 			exitCode:   139,
 			wantState:  StateFailed,
 			wantErrMsg: "worker crashed (exit 139)",
+			wantLogRaw: true,
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			gotState, gotErrMsg := Classify(tt.exitCode, tt.oomKilled, tt.logTail)
+			gotState, gotErrMsg, gotLogRaw := Classify(tt.exitCode, tt.oomKilled, tt.logTail)
 			if gotState != tt.wantState {
 				t.Errorf("Classify() state = %v, want %v", gotState, tt.wantState)
 			}
 			if gotErrMsg != tt.wantErrMsg {
 				t.Errorf("Classify() error = %q, want %q", gotErrMsg, tt.wantErrMsg)
+			}
+			if gotLogRaw != tt.wantLogRaw {
+				t.Errorf("Classify() logRaw = %v, want %v", gotLogRaw, tt.wantLogRaw)
 			}
 		})
 	}

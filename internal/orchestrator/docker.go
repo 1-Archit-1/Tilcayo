@@ -427,8 +427,8 @@ func (d *DockerOrchestrator) buildExitEvent(
 	}
 
 	tail := d.fetchLogTail(ctx, containerID)
-	state, errMsg := Classify(st.ExitCode, st.OOMKilled, tail)
-	if errMsg == "worker failed without a message" || strings.HasPrefix(errMsg, "worker crashed") {
+	state, errMsg, logRaw := Classify(st.ExitCode, st.OOMKilled, tail)
+	if logRaw {
 		d.logRawTail(jobID, errMsg, tail)
 	}
 

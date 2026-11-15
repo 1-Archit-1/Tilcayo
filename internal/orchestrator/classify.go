@@ -64,22 +64,24 @@ func lastLine(tail string) string {
 }
 
 // Classify determines the job State and error message from orchestrator signals per ADR 0001.
-func Classify(exitCode int, oomKilled bool, logTail string) (State, string) {
+// logRaw is true for "worker failed without a message" and "worker crashed (exit N)":
+// ADR 0001 says the caller then logs the raw tail to the control-plane log.
+func Classify(exitCode int, oomKilled bool, logTail string) (state State, msg string, logRaw bool) {
 	switch {
 	case exitCode == 0:
-		return StateSucceeded, ""
+		return StateSucceeded, "", false
 	case oomKilled:
-		return StateFailed, "out of memory"
+		return StateFailed, "out of memory", false
 	case exitCode == exitKilled:
-		return StateFailed, "timed out"
+		return StateFailed, "timed out", false
 	case exitCode == exitTerminated:
-		return StateCancelled, ""
+		return StateCancelled, "", false
 	case exitCode == exitWorkerError:
 		if msg, ok := strings.CutPrefix(lastLine(logTail), ErrorSentinel); ok {
-			return StateFailed, unescapeSentinel(msg)
+			return StateFailed, unescapeSentinel(msg), false
 		}
-		return StateFailed, "worker failed without a message"
+		return StateFailed, "worker failed without a message", true
 	default:
-		return StateFailed, fmt.Sprintf("worker crashed (exit %d)", exitCode)
+		return StateFailed, fmt.Sprintf("worker crashed (exit %d)", exitCode), true
 	}
 }
