@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"os/signal"
+	"syscall"
 	"time"
 
 	"github.com/1-Archit-1/Tilcayo/internal/api"
@@ -15,12 +17,23 @@ import (
 	"github.com/moby/moby/client"
 )
 
+// main only exits; run returns instead, so its deferred cleanup always runs.
 func main() {
-	cfg, err := config.Load()
-	if err != nil {
+	if err := run(); err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		os.Exit(1)
 	}
+}
+
+func run() error {
+	cfg, err := config.Load()
+	if err != nil {
+		return err
+	}
+
+	// SIGINT or SIGTERM cancels ctx, which starts a graceful shutdown.
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
 
 	cache := jobcache.New()
 
@@ -33,21 +46,31 @@ func main() {
 	case config.OrchestratorDocker:
 		orch, cleanup, err = newDockerOrchestrator(&cfg)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "Failed to initialize Docker orchestrator: %v\n", err)
-			os.Exit(1)
+			return fmt.Errorf("failed to initialize Docker orchestrator: %w", err)
 		}
 		defer cleanup()
 
 	case config.OrchestratorKubernetes:
 		// Future K8s / k3s:
 		// orch, cleanup, err = newK8sOrchestrator(&cfg)
-		fmt.Fprintf(os.Stderr, "Kubernetes orchestrator not implemented yet\n")
-		os.Exit(1)
+		return errors.New("Kubernetes orchestrator not implemented yet")
 
 	default:
-		fmt.Fprintf(os.Stderr, "Unknown orchestrator: %s\n", cfg.Orchestrator)
-		os.Exit(1)
+		return fmt.Errorf("unknown orchestrator: %s", cfg.Orchestrator)
 	}
+
+	// The watcher closes events when ctx is cancelled, which ends this loop.
+	events, err := orch.Events(ctx)
+	if err != nil {
+		return fmt.Errorf("watch orchestrator events: %w", err)
+	}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for ev := range events {
+			cache.Update(ev)
+		}
+	}()
 
 	srv := api.NewServer(&cfg, cache, orch)
 
@@ -62,10 +85,31 @@ func main() {
 	fmt.Printf("Tilcayo starting on %s in %s mode (orchestrator: %s)\n",
 		cfg.ListenAddr, cfg.ResultsMode, cfg.Orchestrator)
 
-	if err := httpServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-		fmt.Fprintf(os.Stderr, "Server error: %v\n", err)
-		os.Exit(1)
+	serveErr := make(chan error, 1)
+	go func() { serveErr <- httpServer.ListenAndServe() }()
+
+	var runErr error
+	select {
+	case <-ctx.Done():
+		fmt.Println("Tilcayo shutting down")
+	case err := <-serveErr:
+		runErr = fmt.Errorf("server error: %w", err)
 	}
+
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := httpServer.Shutdown(shutdownCtx); err != nil {
+		fmt.Fprintf(os.Stderr, "Warning: HTTP shutdown: %v\n", err)
+	}
+
+	// Stop the event watcher; a server error gets here with ctx still live.
+	stop()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		fmt.Fprintf(os.Stderr, "Warning: event watcher did not stop within 5s\n")
+	}
+	return runErr
 }
 
 func newDockerOrchestrator(cfg *config.Config) (orchestrator.Orchestrator, func(), error) {
