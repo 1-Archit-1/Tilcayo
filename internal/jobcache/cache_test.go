@@ -320,12 +320,18 @@ func TestUpdate_DestroyEviction(t *testing.T) {
 		Deleted: true,
 	}
 
-	_, _, found := c.Update(ev)
-	if !found {
-		t.Fatalf("Update(Deleted) found = false, want true")
+	job, changed, found := c.Update(ev)
+	if !found || !changed || job != (jobcache.Job{}) {
+		t.Fatalf("Update(Deleted) = (%+v, changed=%v, found=%v), want empty, true, true", job, changed, found)
 	}
 
 	if _, ok := c.Get("job-to-destroy"); ok {
 		t.Fatalf("job still in cache after destroy event")
+	}
+
+	// Deleting it again: nothing left to delete.
+	job, changed, found = c.Update(ev)
+	if found || changed || job != (jobcache.Job{}) {
+		t.Fatalf("second Update(Deleted) = (%+v, changed=%v, found=%v), want empty, false, false", job, changed, found)
 	}
 }

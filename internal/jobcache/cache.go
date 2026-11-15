@@ -74,17 +74,25 @@ func (c *Cache) Get(id string) (Job, bool) {
 	return job, ok
 }
 
-// Update applies a JobEvent to an existing job in the cache. It updates the state,
-// and if terminal, records ExitCode, Error, and FinishedAt.
+// Update applies a JobEvent to the cache and returns the job as stored after
+// the event. found reports whether a job with event.JobID was already cached
+// before the event. changed reports whether the event changed what the cache
+// holds, so the caller can act exactly once when a job becomes terminal (for
+// example, fire its webhook). There are three paths:
 //
-// A terminal state is final: events for a job that is already terminal are
-// ignored, because Events replays every job's state after a reconnect and a
-// cancelled job's container still reports its exit afterwards (issue #7).
-// Events with an empty State are ignored too.
-//
-// found is false if no job has event.JobID; job is then empty. changed reports
-// whether this event changed the stored state, so the caller can act exactly
-// once when a job becomes terminal (for example, fire its webhook).
+//   - Deleted: the job is removed. A known job returns (Job{}, true, true);
+//     an unknown one returns (Job{}, false, false).
+//   - Unknown job ID: if event.Engine is set, the job is inserted from the
+//     event (the startup snapshot rebuilding a job after a restart) and
+//     Update returns (job, true, false). Without an Engine nothing is stored
+//     and Update returns (Job{}, false, false).
+//   - Known job: the state is updated and, if terminal, ExitCode, Error and
+//     FinishedAt are recorded. A terminal state is final: events for a job
+//     that is already terminal are ignored, because Events replays every
+//     job's state after a reconnect and a cancelled job's container still
+//     reports its exit afterwards (issue #7). Events with an empty State or
+//     the current State are ignored too. Ignored events return
+//     (job, false, true).
 func (c *Cache) Update(event orchestrator.JobEvent) (job Job, changed, found bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -92,7 +100,7 @@ func (c *Cache) Update(event orchestrator.JobEvent) (job Job, changed, found boo
 	if event.Deleted {
 		if _, ok := c.jobs[event.JobID]; ok {
 			delete(c.jobs, event.JobID)
-			return Job{}, false, true
+			return Job{}, true, true
 		}
 		return Job{}, false, false
 	}
