@@ -88,9 +88,33 @@ func (c *Cache) Get(id string) (Job, bool) {
 func (c *Cache) Update(event orchestrator.JobEvent) (job Job, changed, found bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+
+	if event.Deleted {
+		if _, ok := c.jobs[event.JobID]; ok {
+			delete(c.jobs, event.JobID)
+			return Job{}, false, true
+		}
+		return Job{}, false, false
+	}
+
 	job, found = c.jobs[event.JobID]
 	if !found {
-		return Job{}, false, false
+		if event.Engine == "" {
+			return Job{}, false, false
+		}
+		job = Job{
+			ID:        event.JobID,
+			Engine:    event.Engine,
+			CreatedAt: event.CreatedAt,
+			State:     event.State,
+		}
+		if event.State.IsTerminal() {
+			job.ExitCode = event.ExitCode
+			job.Error = event.Error
+			job.FinishedAt = event.FinishedAt
+		}
+		c.jobs[event.JobID] = job
+		return job, true, false
 	}
 	if job.State.IsTerminal() || event.State == "" || event.State == job.State {
 		return job, false, true

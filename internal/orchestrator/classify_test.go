@@ -47,6 +47,21 @@ func TestClassify(t *testing.T) {
 			wantErrMsg: "out of memory",
 		},
 		{
+			name:       "out of memory with exit 1 (amended ADR 0001)",
+			exitCode:   1,
+			oomKilled:  true,
+			logTail:    "tilcayo-error: misleading python error",
+			wantState:  StateFailed,
+			wantErrMsg: "out of memory",
+		},
+		{
+			name:       "out of memory with crash exit 2 (amended ADR 0001)",
+			exitCode:   2,
+			oomKilled:  true,
+			wantState:  StateFailed,
+			wantErrMsg: "out of memory",
+		},
+		{
 			name:       "timeout exit 137",
 			exitCode:   137,
 			oomKilled:  false,

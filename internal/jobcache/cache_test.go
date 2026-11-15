@@ -277,3 +277,55 @@ func TestConcurrentAccess(t *testing.T) {
 		t.Fatalf("List() count = %d, want %d", len(all), expectedTotal)
 	}
 }
+
+func TestUpdate_SnapshotRebuild(t *testing.T) {
+	c := jobcache.New()
+	createdAt := time.Now().Add(-5 * time.Minute)
+
+	ev := orchestrator.JobEvent{
+		JobID:     "job-recovered",
+		Engine:    "general",
+		CreatedAt: createdAt,
+		State:     orchestrator.StateRunning,
+	}
+
+	job, changed, found := c.Update(ev)
+	if found {
+		t.Fatalf("Update() found = true for unknown job, want false")
+	}
+	if !changed {
+		t.Fatalf("Update() changed = false for new job, want true")
+	}
+	if job.ID != "job-recovered" || job.Engine != "general" || job.State != orchestrator.StateRunning {
+		t.Fatalf("Update() returned unexpected job: %+v", job)
+	}
+
+	got, ok := c.Get("job-recovered")
+	if !ok {
+		t.Fatalf("Get('job-recovered') returned false after snapshot rebuild")
+	}
+	if got.Engine != "general" || !got.CreatedAt.Equal(createdAt) || got.State != orchestrator.StateRunning {
+		t.Fatalf("Get('job-recovered') got %+v, want Engine=general, State=running", got)
+	}
+}
+
+func TestUpdate_DestroyEviction(t *testing.T) {
+	c := jobcache.New()
+	if err := c.Put(jobcache.Job{ID: "job-to-destroy", Engine: "general"}); err != nil {
+		t.Fatal(err)
+	}
+
+	ev := orchestrator.JobEvent{
+		JobID:   "job-to-destroy",
+		Deleted: true,
+	}
+
+	_, _, found := c.Update(ev)
+	if !found {
+		t.Fatalf("Update(Deleted) found = false, want true")
+	}
+
+	if _, ok := c.Get("job-to-destroy"); ok {
+		t.Fatalf("job still in cache after destroy event")
+	}
+}

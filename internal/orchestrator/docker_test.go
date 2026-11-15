@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"slices"
@@ -13,6 +14,7 @@ import (
 
 	cerrdefs "github.com/containerd/errdefs"
 	"github.com/moby/moby/api/types/container"
+	"github.com/moby/moby/api/types/events"
 	"github.com/moby/moby/api/types/mount"
 	"github.com/moby/moby/client"
 
@@ -36,6 +38,12 @@ type mockDockerClient struct {
 	missingImages map[string]bool
 	failImage     error // every ImageInspect fails with this
 	inspected     []string
+
+	listItems   []container.Summary
+	inspectResp map[string]client.ContainerInspectResult
+	logsResp    map[string]io.ReadCloser
+	eventsMsgCh chan events.Message
+	eventsErrCh chan error
 }
 
 func (m *mockDockerClient) Ping(ctx context.Context, opts client.PingOptions) (client.PingResult, error) {
@@ -81,6 +89,43 @@ func (m *mockDockerClient) ContainerRemove(ctx context.Context, containerID stri
 	m.removeID = containerID
 	m.removeOpts = options
 	return client.ContainerRemoveResult{}, nil
+}
+
+func (m *mockDockerClient) ContainerList(ctx context.Context, opts client.ContainerListOptions) (client.ContainerListResult, error) {
+	return client.ContainerListResult{Items: m.listItems}, nil
+}
+
+func (m *mockDockerClient) ContainerInspect(ctx context.Context, containerID string, opts client.ContainerInspectOptions) (client.ContainerInspectResult, error) {
+	if m.inspectResp != nil {
+		if resp, ok := m.inspectResp[containerID]; ok {
+			return resp, nil
+		}
+	}
+	return client.ContainerInspectResult{}, nil
+}
+
+func (m *mockDockerClient) ContainerLogs(ctx context.Context, containerID string, opts client.ContainerLogsOptions) (client.ContainerLogsResult, error) {
+	if m.logsResp != nil {
+		if r, ok := m.logsResp[containerID]; ok {
+			return r, nil
+		}
+	}
+	return io.NopCloser(strings.NewReader("")), nil
+}
+
+func (m *mockDockerClient) Events(ctx context.Context, opts client.EventsListOptions) client.EventsResult {
+	msgCh := m.eventsMsgCh
+	if msgCh == nil {
+		msgCh = make(chan events.Message)
+	}
+	errCh := m.eventsErrCh
+	if errCh == nil {
+		errCh = make(chan error)
+	}
+	return client.EventsResult{
+		Messages: msgCh,
+		Err:      errCh,
+	}
 }
 
 func TestDockerOrchestrator_Run_S3Success(t *testing.T) {

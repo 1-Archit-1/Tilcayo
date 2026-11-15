@@ -15,10 +15,13 @@ type JobSpec struct {
 // ExitCode, Error, and FinishedAt are only meaningful once State.IsTerminal() is true.
 type JobEvent struct {
 	JobID      string
+	Engine     string
+	CreatedAt  time.Time
 	State      State
 	ExitCode   int
 	Error      string
 	FinishedAt time.Time
+	Deleted    bool
 }
 
 // Orchestrator defines the contract for managing worker lifecycles across backends (Docker, Kubernetes).

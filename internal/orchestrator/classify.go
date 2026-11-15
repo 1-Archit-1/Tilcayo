@@ -68,7 +68,7 @@ func Classify(exitCode int, oomKilled bool, logTail string) (State, string) {
 	switch {
 	case exitCode == 0:
 		return StateSucceeded, ""
-	case exitCode == exitKilled && oomKilled:
+	case oomKilled:
 		return StateFailed, "out of memory"
 	case exitCode == exitKilled:
 		return StateFailed, "timed out"
