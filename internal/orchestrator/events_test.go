@@ -4,9 +4,12 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
+	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 	"unicode/utf8"
@@ -346,6 +349,205 @@ func TestEvents_LiveStream(t *testing.T) {
 		}
 	case <-time.After(1 * time.Second):
 		t.Fatalf("timed out waiting for Events channel to close on cancellation")
+	}
+}
+
+// errLog records messages from the logErr seam; the watch goroutine writes them.
+type errLog struct {
+	mu   sync.Mutex
+	msgs []string
+}
+
+func (l *errLog) log(msg string) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.msgs = append(l.msgs, msg)
+}
+
+// waitFor waits until a logged message contains all of want, and returns it.
+func (l *errLog) waitFor(t *testing.T, want ...string) string {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		l.mu.Lock()
+		for _, m := range l.msgs {
+			ok := true
+			for _, w := range want {
+				ok = ok && strings.Contains(m, w)
+			}
+			if ok {
+				l.mu.Unlock()
+				return m
+			}
+		}
+		l.mu.Unlock()
+		time.Sleep(5 * time.Millisecond)
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	t.Fatalf("no logged message contains %q; got %q", want, l.msgs)
+	return ""
+}
+
+// shortBackoff shortens the reconnect backoff for one test.
+func shortBackoff(t *testing.T, lo, hi time.Duration) {
+	t.Helper()
+	oldLo, oldHi := reconnectMinBackoff, reconnectMaxBackoff
+	reconnectMinBackoff, reconnectMaxBackoff = lo, hi
+	t.Cleanup(func() { reconnectMinBackoff, reconnectMaxBackoff = oldLo, oldHi })
+}
+
+// waitClosed cancels ctx and waits for the Events channel to close.
+func waitClosed(t *testing.T, cancel context.CancelFunc, ch <-chan JobEvent) {
+	t.Helper()
+	cancel()
+	timeout := time.After(time.Second)
+	for {
+		select {
+		case _, ok := <-ch:
+			if !ok {
+				return
+			}
+		case <-timeout:
+			t.Fatal("Events channel not closed within 1s of cancellation")
+		}
+	}
+}
+
+func exitedSummary(id, jobID string) container.Summary {
+	return container.Summary{
+		ID: id,
+		Labels: map[string]string{
+			"app.kubernetes.io/managed-by": "tilcayo",
+			"tilcayo.io/job-id":            jobID,
+			"tilcayo.io/engine":            "general",
+		},
+	}
+}
+
+func TestEvents_LogsReadErrorIsLogged(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	mock := &mockDockerClient{
+		listItems: []container.Summary{exitedSummary("cid-1", "job-logs")},
+		inspectResp: map[string]client.ContainerInspectResult{
+			"cid-1": {Container: container.InspectResponse{State: &container.State{Status: "exited", ExitCode: 1}}},
+		},
+		failLogs: errors.New("logs boom"),
+	}
+	var logs errLog
+	orch := NewDockerOrchestrator(mock, &config.Config{})
+	orch.logErr = logs.log
+	orch.logRaw = func(string, string, string) {}
+
+	ch, _ := orch.Events(ctx)
+	ev := <-ch
+	if ev.JobID != "job-logs" || ev.Error != "worker failed without a message" {
+		t.Errorf("ev = %+v, want job-logs, worker failed without a message", ev)
+	}
+	logs.waitFor(t, "job-logs", "cid-1", "logs boom")
+	waitClosed(t, cancel, ch)
+}
+
+func TestEvents_InspectErrorIsLogged(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	msgCh := make(chan events.Message)
+	mock := &mockDockerClient{
+		listItems:   []container.Summary{exitedSummary("cid-snap", "job-snap")},
+		failInspect: errors.New("inspect boom"),
+		eventsMsgCh: msgCh,
+	}
+	var logs errLog
+	orch := NewDockerOrchestrator(mock, &config.Config{})
+	orch.logErr = logs.log
+
+	ch, _ := orch.Events(ctx)
+	logs.waitFor(t, "snapshot", "job-snap", "cid-snap", "inspect boom")
+
+	msgCh <- events.Message{
+		Action: "die",
+		Actor:  events.Actor{ID: "cid-die", Attributes: exitedSummary("", "job-die").Labels},
+	}
+	logs.waitFor(t, "job-die", "cid-die", "inspect boom")
+	waitClosed(t, cancel, ch)
+}
+
+func TestEvents_ReconnectBacksOffWhileDaemonIsDown(t *testing.T) {
+	shortBackoff(t, 10*time.Millisecond, 40*time.Millisecond)
+	ctx, cancel := context.WithCancel(context.Background())
+	mock := &mockDockerClient{
+		failList:  errors.New("daemon down"),
+		eventsErr: errors.New("stream down"),
+	}
+	var logs errLog
+	orch := NewDockerOrchestrator(mock, &config.Config{})
+	orch.logErr = logs.log
+
+	ch, _ := orch.Events(ctx)
+	deadline := time.Now().Add(2 * time.Second)
+	var calls []time.Time
+	for len(calls) < 6 && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+		mock.mu.Lock()
+		calls = slices.Clone(mock.listCalls)
+		mock.mu.Unlock()
+	}
+	waitClosed(t, cancel, ch)
+
+	if len(calls) < 6 {
+		t.Fatalf("got %d reconnect cycles in 2s, want >= 6", len(calls))
+	}
+	// Each pause is at least the backoff: 10, 20, 40, then capped at 40 ms.
+	want := []time.Duration{10, 20, 40, 40, 40}
+	for i, w := range want {
+		if gap := calls[i+1].Sub(calls[i]); gap < w*time.Millisecond {
+			t.Errorf("pause %d = %v, want >= %v", i, gap, w*time.Millisecond)
+		}
+	}
+	logs.waitFor(t, "list containers", "daemon down")
+	logs.waitFor(t, "event stream", "stream down")
+}
+
+func TestEvents_ReconnectBackoffResetsWhenConnected(t *testing.T) {
+	// Without the reset, 12 cycles would pause 1+2+...+2048 ms, about 4 s.
+	shortBackoff(t, time.Millisecond, 10*time.Second)
+	ctx, cancel := context.WithCancel(context.Background())
+	mock := &mockDockerClient{eventsErr: errors.New("stream dropped")}
+	orch := NewDockerOrchestrator(mock, &config.Config{})
+	orch.logErr = func(string) {}
+
+	start := time.Now()
+	ch, _ := orch.Events(ctx)
+	for {
+		mock.mu.Lock()
+		n := len(mock.listCalls)
+		mock.mu.Unlock()
+		if n >= 12 {
+			break
+		}
+		if time.Since(start) > time.Second {
+			t.Fatalf("only %d cycles in 1s; backoff did not reset after a connected cycle", n)
+		}
+		time.Sleep(time.Millisecond)
+	}
+	waitClosed(t, cancel, ch)
+}
+
+func TestLogf_SkipsShutdownCancellation(t *testing.T) {
+	var logs errLog
+	orch := NewDockerOrchestrator(&mockDockerClient{}, &config.Config{})
+	orch.logErr = logs.log
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	orch.logf(ctx, "should not appear")
+
+	timedOut, cancel2 := context.WithTimeout(context.Background(), 0)
+	defer cancel2()
+	<-timedOut.Done()
+	orch.logf(timedOut, "call timed out")
+
+	if len(logs.msgs) != 1 || logs.msgs[0] != "call timed out" {
+		t.Errorf("logged %q, want only the timeout", logs.msgs)
 	}
 }
 

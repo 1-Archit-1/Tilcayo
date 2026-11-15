@@ -3,6 +3,7 @@ package orchestrator
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -52,6 +53,13 @@ var (
 	inspectTimeout    = 10 * time.Second
 )
 
+// Event watcher timings. Variables so tests can shorten them.
+var (
+	containerCallTimeout = 10 * time.Second       // inspect + logs for one container
+	reconnectMinBackoff  = 250 * time.Millisecond // pause before reconnecting the event stream
+	reconnectMaxBackoff  = 5 * time.Second        // cap while the daemon stays unreachable
+)
+
 // DockerOrchestrator implements Orchestrator by running workers as Docker containers.
 type DockerOrchestrator struct {
 	cli          DockerClient
@@ -60,6 +68,7 @@ type DockerOrchestrator struct {
 	rootFallback bool                                  // the control plane is root, so workers use the image default
 	chown        func(name string, uid, gid int) error // os.Chown; replaced in tests
 	logRaw       func(jobID, errMsg, tail string)      // test seam: logs raw tail on crash / failed without message
+	logErr       func(msg string)                      // test seam: logs event-watcher errors
 }
 
 // NewDockerOrchestrator creates a new DockerOrchestrator for a control plane
@@ -338,19 +347,37 @@ func (d *DockerOrchestrator) logRawTail(jobID, errMsg, tail string) {
 	fmt.Fprintf(os.Stderr, "tilcayo: job %s %s; log tail:\n%s\n", jobID, errMsg, tail)
 }
 
-func (d *DockerOrchestrator) fetchLogTail(ctx context.Context, containerID string) string {
+// logf logs an error from the event watcher to the control-plane log, unless
+// ctx was cancelled: that only happens at shutdown, and the error is ours.
+func (d *DockerOrchestrator) logf(ctx context.Context, format string, args ...any) {
+	if errors.Is(ctx.Err(), context.Canceled) {
+		return
+	}
+	msg := fmt.Sprintf(format, args...)
+	if d.logErr != nil {
+		d.logErr(msg)
+		return
+	}
+	fmt.Fprintf(os.Stderr, "tilcayo: %s\n", msg)
+}
+
+// fetchLogTail returns the capped log tail of a container, or "" if the logs
+// cannot be read. Classify then sees no sentinel, so the error is logged.
+func (d *DockerOrchestrator) fetchLogTail(ctx context.Context, containerID, jobID string) string {
 	res, err := d.cli.ContainerLogs(ctx, containerID, client.ContainerLogsOptions{
 		ShowStdout: true,
 		ShowStderr: true,
 		Tail:       "80",
 	})
 	if err != nil {
+		d.logf(ctx, "job %s: read logs of container %s: %v", jobID, containerID, err)
 		return ""
 	}
 	defer res.Close()
 
 	tail, err := deframeAndCapLogs(res)
 	if err != nil {
+		d.logf(ctx, "job %s: read logs of container %s: %v", jobID, containerID, err)
 		return ""
 	}
 	return tail
@@ -376,24 +403,34 @@ func (d *DockerOrchestrator) watchEvents(ctx context.Context, out chan<- JobEven
 		Add("type", "container").
 		Add("label", "app.kubernetes.io/managed-by=tilcayo")
 
+	// Pause before reconnecting, doubling after each cycle that could not
+	// reach the daemon so a daemon that is down is not hammered.
+	backoff := reconnectMinBackoff
 	for ctx.Err() == nil {
-		if !d.runEventCycle(ctx, out, eventFilter) {
+		ok, connected := d.runEventCycle(ctx, out, eventFilter)
+		if !ok {
 			return
 		}
+		if connected {
+			backoff = reconnectMinBackoff
+		}
 
-		// Brief pause before reconnecting if the stream closed or errored.
 		select {
 		case <-ctx.Done():
 			return
-		case <-time.After(250 * time.Millisecond):
+		case <-time.After(backoff):
+		}
+		if !connected {
+			backoff = min(2*backoff, reconnectMaxBackoff)
 		}
 	}
 }
 
 // runEventCycle executes one subscribe -> snapshot -> stream cycle with a
 // per-iteration child context so the Docker SDK's HTTP stream is always closed
-// when the cycle ends. Returns false if the parent ctx was cancelled.
-func (d *DockerOrchestrator) runEventCycle(ctx context.Context, out chan<- JobEvent, filter client.Filters) bool {
+// when the cycle ends. ok is false if the parent ctx was cancelled. connected
+// reports whether the snapshot could list containers, i.e. the daemon answered.
+func (d *DockerOrchestrator) runEventCycle(ctx context.Context, out chan<- JobEvent, filter client.Filters) (ok, connected bool) {
 	iterCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
@@ -401,11 +438,12 @@ func (d *DockerOrchestrator) runEventCycle(ctx context.Context, out chan<- JobEv
 	// are buffered in the stream rather than lost in the gap.
 	res := d.cli.Events(iterCtx, client.EventsListOptions{Filters: filter})
 
-	if !d.emitSnapshot(iterCtx, out) {
-		return false
+	connected, ok = d.emitSnapshot(iterCtx, out)
+	if !ok {
+		return false, connected
 	}
 
-	return d.consumeEventStream(iterCtx, out, res.Messages, res.Err)
+	return d.consumeEventStream(iterCtx, out, res.Messages, res.Err), connected
 }
 
 // emitEvent sends ev on out unless ctx is cancelled first.
@@ -432,7 +470,7 @@ func (d *DockerOrchestrator) buildExitEvent(
 		finishedAt = t
 	}
 
-	tail := d.fetchLogTail(ctx, containerID)
+	tail := d.fetchLogTail(ctx, containerID, jobID)
 	state, errMsg, logRaw := Classify(st.ExitCode, st.OOMKilled, tail)
 	if logRaw {
 		d.logRawTail(jobID, errMsg, tail)
@@ -451,14 +489,16 @@ func (d *DockerOrchestrator) buildExitEvent(
 
 // emitSnapshot lists all existing Tilcayo containers and emits their current state
 // so the cache can recover running or finished jobs after a control-plane restart.
-func (d *DockerOrchestrator) emitSnapshot(ctx context.Context, out chan<- JobEvent) bool {
+// listed reports whether ContainerList succeeded; ok is false if ctx was cancelled.
+func (d *DockerOrchestrator) emitSnapshot(ctx context.Context, out chan<- JobEvent) (listed, ok bool) {
 	list, err := d.cli.ContainerList(ctx, client.ContainerListOptions{
 		All:     true,
 		Filters: client.Filters{}.Add("label", "app.kubernetes.io/managed-by=tilcayo"),
 	})
 	if err != nil {
 		// Snapshot is best-effort; proceed to live streaming if listing fails.
-		return ctx.Err() == nil
+		d.logf(ctx, "snapshot: list containers: %v", err)
+		return false, ctx.Err() == nil
 	}
 
 	for _, c := range list.Items {
@@ -469,39 +509,53 @@ func (d *DockerOrchestrator) emitSnapshot(ctx context.Context, out chan<- JobEve
 		if jobID == "" {
 			continue
 		}
-		engine := c.Labels["tilcayo.io/engine"]
-		createdAt := time.Unix(c.Created, 0).UTC()
 
-		insp, err := d.cli.ContainerInspect(ctx, c.ID, client.ContainerInspectOptions{})
-		if err != nil {
+		// Bound the Docker calls for one container so a hung call cannot
+		// stall every other job's events.
+		callCtx, cancel := context.WithTimeout(ctx, containerCallTimeout)
+		ev, found := d.snapshotEvent(callCtx, c, jobID)
+		cancel()
+		if !found {
 			continue
 		}
 
-		var ev JobEvent
-		switch {
-		case insp.Container.State.Running:
-			ev = JobEvent{
-				JobID:     jobID,
-				Engine:    engine,
-				CreatedAt: createdAt,
-				State:     StateRunning,
-			}
-		case insp.Container.State.Status == "exited" || insp.Container.State.ExitCode != 0:
-			ev = d.buildExitEvent(ctx, c.ID, jobID, engine, createdAt, insp.Container.State)
-		default:
-			ev = JobEvent{
-				JobID:     jobID,
-				Engine:    engine,
-				CreatedAt: createdAt,
-				State:     StatePending,
-			}
-		}
-
 		if !emitEvent(ctx, out, ev) {
-			return false
+			return true, false
 		}
 	}
-	return true
+	return true, true
+}
+
+// snapshotEvent inspects one listed container and returns its current state.
+// found is false if the container could not be inspected.
+func (d *DockerOrchestrator) snapshotEvent(ctx context.Context, c container.Summary, jobID string) (ev JobEvent, found bool) {
+	engine := c.Labels["tilcayo.io/engine"]
+	createdAt := time.Unix(c.Created, 0).UTC()
+
+	insp, err := d.cli.ContainerInspect(ctx, c.ID, client.ContainerInspectOptions{})
+	if err != nil {
+		d.logf(ctx, "snapshot: job %s: inspect container %s: %v", jobID, c.ID, err)
+		return JobEvent{}, false
+	}
+
+	switch {
+	case insp.Container.State.Running:
+		return JobEvent{
+			JobID:     jobID,
+			Engine:    engine,
+			CreatedAt: createdAt,
+			State:     StateRunning,
+		}, true
+	case insp.Container.State.Status == "exited" || insp.Container.State.ExitCode != 0:
+		return d.buildExitEvent(ctx, c.ID, jobID, engine, createdAt, insp.Container.State), true
+	default:
+		return JobEvent{
+			JobID:     jobID,
+			Engine:    engine,
+			CreatedAt: createdAt,
+			State:     StatePending,
+		}, true
+	}
 }
 
 // consumeEventStream reads live Docker events until the stream errors, closes,
@@ -516,7 +570,11 @@ func (d *DockerOrchestrator) consumeEventStream(
 		select {
 		case <-ctx.Done():
 			return false
-		case <-errs:
+		case err := <-errs:
+			// The SDK closes errs after sending, so err can be nil.
+			if err != nil {
+				d.logf(ctx, "event stream: %v; reconnecting", err)
+			}
 			return true
 		case msg, ok := <-msgs:
 			if !ok {
@@ -550,15 +608,12 @@ func (d *DockerOrchestrator) handleDockerEvent(ctx context.Context, out chan<- J
 		})
 
 	case "die":
-		insp, err := d.cli.ContainerInspect(ctx, msg.Actor.ID, client.ContainerInspectOptions{})
-		if err != nil {
+		callCtx, cancel := context.WithTimeout(ctx, containerCallTimeout)
+		ev, found := d.dieEvent(callCtx, msg.Actor.ID, jobID, engine)
+		cancel()
+		if !found {
 			return true
 		}
-		var createdAt time.Time
-		if t, err := time.Parse(time.RFC3339Nano, insp.Container.Created); err == nil {
-			createdAt = t
-		}
-		ev := d.buildExitEvent(ctx, msg.Actor.ID, jobID, engine, createdAt, insp.Container.State)
 		return emitEvent(ctx, out, ev)
 
 	case "destroy":
@@ -568,6 +623,21 @@ func (d *DockerOrchestrator) handleDockerEvent(ctx context.Context, out chan<- J
 		})
 	}
 	return true
+}
+
+// dieEvent inspects a container that just exited and returns its terminal event.
+// found is false if the container could not be inspected.
+func (d *DockerOrchestrator) dieEvent(ctx context.Context, containerID, jobID, engine string) (ev JobEvent, found bool) {
+	insp, err := d.cli.ContainerInspect(ctx, containerID, client.ContainerInspectOptions{})
+	if err != nil {
+		d.logf(ctx, "job %s: inspect container %s after exit: %v", jobID, containerID, err)
+		return JobEvent{}, false
+	}
+	var createdAt time.Time
+	if t, err := time.Parse(time.RFC3339Nano, insp.Container.Created); err == nil {
+		createdAt = t
+	}
+	return d.buildExitEvent(ctx, containerID, jobID, engine, createdAt, insp.Container.State), true
 }
 
 // Cancel terminates the worker container for the specified job.

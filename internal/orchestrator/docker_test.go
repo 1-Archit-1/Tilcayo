@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -44,6 +45,14 @@ type mockDockerClient struct {
 	logsResp    map[string]io.ReadCloser
 	eventsMsgCh chan events.Message
 	eventsErrCh chan error
+	eventsErr   error // if set, every Events stream fails at once with this
+
+	failList    error
+	failInspect error
+	failLogs    error
+
+	mu        sync.Mutex
+	listCalls []time.Time
 }
 
 func (m *mockDockerClient) Ping(ctx context.Context, opts client.PingOptions) (client.PingResult, error) {
@@ -92,10 +101,19 @@ func (m *mockDockerClient) ContainerRemove(ctx context.Context, containerID stri
 }
 
 func (m *mockDockerClient) ContainerList(ctx context.Context, opts client.ContainerListOptions) (client.ContainerListResult, error) {
+	m.mu.Lock()
+	m.listCalls = append(m.listCalls, time.Now())
+	m.mu.Unlock()
+	if m.failList != nil {
+		return client.ContainerListResult{}, m.failList
+	}
 	return client.ContainerListResult{Items: m.listItems}, nil
 }
 
 func (m *mockDockerClient) ContainerInspect(ctx context.Context, containerID string, opts client.ContainerInspectOptions) (client.ContainerInspectResult, error) {
+	if m.failInspect != nil {
+		return client.ContainerInspectResult{}, m.failInspect
+	}
 	if m.inspectResp != nil {
 		if resp, ok := m.inspectResp[containerID]; ok {
 			return resp, nil
@@ -105,6 +123,9 @@ func (m *mockDockerClient) ContainerInspect(ctx context.Context, containerID str
 }
 
 func (m *mockDockerClient) ContainerLogs(ctx context.Context, containerID string, opts client.ContainerLogsOptions) (client.ContainerLogsResult, error) {
+	if m.failLogs != nil {
+		return nil, m.failLogs
+	}
 	if m.logsResp != nil {
 		if r, ok := m.logsResp[containerID]; ok {
 			return r, nil
@@ -114,6 +135,11 @@ func (m *mockDockerClient) ContainerLogs(ctx context.Context, containerID string
 }
 
 func (m *mockDockerClient) Events(ctx context.Context, opts client.EventsListOptions) client.EventsResult {
+	if m.eventsErr != nil {
+		errCh := make(chan error, 1)
+		errCh <- m.eventsErr
+		return client.EventsResult{Messages: make(chan events.Message), Err: errCh}
+	}
 	msgCh := m.eventsMsgCh
 	if msgCh == nil {
 		msgCh = make(chan events.Message)
